@@ -59,7 +59,7 @@ cd ../..
 For docker users, we suggest using a base image from [here](https://github.com/fwilliams/openvdb/tree/fw/fvdb/fvdb#docker-image), and applying the above conda setup over it.
 
 ## Quickstart
-Download pretrained checkpoints from [Google Drive](https://drive.google.com/drive/folders/1PEh0ofpSFcgH56SZtu6iQPC8xAxzhmke?usp=drive_link) and put them under `checkpoints`.
+Download pretrained checkpoints from [Huggingface](https://huggingface.co/xrenaa/XCube) and put them under `checkpoints`.
 Alternatively, we provide a script that could automatically download everything for you (temporarily unavailable):
 ```
 python inference/download_pretrain.py
