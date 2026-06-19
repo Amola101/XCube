@@ -9,6 +9,7 @@
 from .shapenet import ShapeNetDataset
 from .waymo import WaymoDataset
 from .objaverse import ObjaverseDataset
+from .gpr import GPRDataset
 
 def build_dataset(name: str, spec, hparams, kwargs: dict, duplicate_num=1):
     return eval(name)(**kwargs, spec=spec, hparams=hparams, duplicate_num=duplicate_num)
