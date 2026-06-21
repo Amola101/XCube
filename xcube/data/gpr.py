@@ -14,7 +14,10 @@ from xcube.data.base import DatasetSpec as DS
 from xcube.data.base import RandomSafeDataset
 
 import fvdb
-fvdb._Cpp.SparseGridBatch = fvdb._Cpp.GridBatch
+# Original: fvdb._Cpp.SparseGridBatch = fvdb._Cpp.GridBatch
+# Guarded because fvdb_core 0.4.2 no longer exposes a `_Cpp` submodule (GridBatch lives at fvdb.GridBatch directly).
+if hasattr(fvdb, "_Cpp"):
+    fvdb._Cpp.SparseGridBatch = fvdb._Cpp.GridBatch
 
 import pickle
 custom_pickle = pickle
