@@ -1,0 +1,56 @@
+include_configs:
+  - ../train/vae/vae_128x128x128_sparse.yaml
+  - gpr.yaml
+
+name: 'gpr/VAE_stage1'
+
+# --- Stage 1 (this config): VAE self-reconstructs GT tube shapes. ---
+# GPRDataset defaults to feeding TEUNet's input_grid as DS.INPUT_PC, which is
+# what Stage 2 (diffusion conditioning) will want. For Stage 1 we instead feed
+# target_grid as DS.INPUT_PC so the VAE learns a latent space of real subsurface
+# object geometry, not TEUNet's flawed reconstructions.
+train_kwargs:
+  input_key: "target_grid"
+val_kwargs:
+  input_key: "target_grid"
+test_kwargs:
+  input_key: "target_grid"
+
+# --- GPR voxel grid setup: 64x64x48 voxels, ~5mm, non-isotropic ---
+voxel_size: [0.005079, 0.005079, 0.005106]
+resolution: "0.005"
+tree_depth: 2
+use_fvdb_loader: true
+use_hash_tree: true
+
+# --- GT grids have no normals/semantics; TEUNet's intensity isn't meaningful ---
+# --- here since Stage 1 never sees TEUNet's grid at all.                    ---
+use_input_normal: false
+use_input_semantic: false
+use_input_intensity: false
+
+supervision:
+  structure_weight: 20.0
+  normal_weight: 0.0
+
+# --- smaller network: GPR grids (64x64x48) are tiny vs Waymo's 512^3+ scenes ---
+cut_ratio: 4
+network:
+  encoder:
+    c_dim: 32
+  unet:
+    target: "StructPredictionNet"
+    params:
+      in_channels: 32
+      num_blocks: ${tree_depth}
+      f_maps: 32
+      neck_dense_type: "UNCHANGED"
+      neck_bound: [32, 32, 24]
+      num_res_blocks: 1
+      use_residual: false
+      order: "gcr"
+      is_add_dec: false
+      use_attention: false
+      use_checkpoint: false
+
+batch_size: 2

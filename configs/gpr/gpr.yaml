@@ -1,0 +1,29 @@
+_gpr_path: "../data/gpr"
+
+train_dataset: GPRDataset
+train_val_num_workers: 4
+train_kwargs:
+  base_path: ${_gpr_path}
+  resolution: ${resolution}
+  custom_name: ${_custom_name}
+  split: "train"
+  random_seed: 0
+
+val_dataset: GPRDataset
+val_kwargs:
+  base_path: ${_gpr_path}
+  resolution: ${resolution}
+  custom_name: ${_custom_name}
+  split: "val"
+  random_seed: "fixed"
+
+test_dataset: GPRDataset
+test_num_workers: 2
+test_kwargs:
+  base_path: ${_gpr_path}
+  resolution: ${resolution}
+  custom_name: ${_custom_name}
+  split: "test"
+  random_seed: "fixed"
+
+_custom_name: "gpr"

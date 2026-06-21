@@ -34,7 +34,7 @@ class GPRDataset(RandomSafeDataset):
 
     def __init__(self, base_path, split, resolution, spec=None,
                  random_seed=0, hparams=None, skip_on_error=False,
-                 custom_name="gpr", duplicate_num=1, **kwargs):
+                 custom_name="gpr", duplicate_num=1, input_key="input_grid", **kwargs):
         if isinstance(random_seed, str):
             super().__init__(0, True, skip_on_error)
         else:
@@ -44,6 +44,10 @@ class GPRDataset(RandomSafeDataset):
         self.resolution = resolution
         self.split = split
         self.spec = spec if spec is not None else [DS.INPUT_PC, DS.GT_DENSE_PC]
+        # Stage 1 (VAE pretraining) sets input_key="target_grid" so the VAE
+        # self-reconstructs GT shapes. Stage 2 (diffusion) uses the default
+        # "input_grid" since TEUNet's output becomes a conditioning signal instead.
+        self.input_key = input_key
 
         split_file = os.path.join(base_path, (split + '.lst'))
         with open(split_file, 'r') as f:
@@ -74,7 +78,7 @@ class GPRDataset(RandomSafeDataset):
             data[DS.SHAPE_NAME] = item_path
 
         if DS.INPUT_PC in self.spec:
-            data[DS.INPUT_PC] = input_data['input_grid']
+            data[DS.INPUT_PC] = input_data[self.input_key]
 
         if DS.GT_DENSE_PC in self.spec:
             data[DS.GT_DENSE_PC] = input_data['target_grid']
