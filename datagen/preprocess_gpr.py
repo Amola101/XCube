@@ -77,15 +77,29 @@ def build_sample(teunet: np.ndarray, gt: np.ndarray, threshold: float):
     teunet_vals = torch.tensor(teunet_vals).unsqueeze(-1)   # (M, 1)
 
     #  Build sparse GridBatch objects
-    gt_grid = fvdb.GridBatch.from_ijk(
+    # Original (used fvdb_core's newer API, no longer installed):
+    #   gt_grid = fvdb.GridBatch.from_ijk(fvdb.JaggedTensor(gt_ijk_t), voxel_sizes=VOXEL_SIZE, origins=[0.0, 0.0, 0.0])
+    #   input_grid = fvdb.GridBatch.from_ijk(fvdb.JaggedTensor(input_ijk_t), voxel_sizes=VOXEL_SIZE, origins=[0.0, 0.0, 0.0])
+    # The fvdb build XCube actually needs (built from source, see README) has no GridBatch.from_ijk
+    # classmethod -- you construct an empty GridBatch and call set_from_ijk on it instead.
+    #
+    # origins=[0,0,0] (above) doesn't match XCube's convention: autoencoder.py's
+    # build_hash_tree_from_grid (and the network's own internal grid construction) places
+    # the grid origin at half a voxel away from world zero, not at zero. Mismatched origins
+    # made xcube/modules/autoencoding/losses/base_loss.py's
+    # "assert torch.allclose(pd_struct.grid.origins, gt_grid.origins)" fail during training.
+    grid_origin = [vs / 2.0 for vs in VOXEL_SIZE]
+    gt_grid = fvdb.GridBatch()
+    gt_grid.set_from_ijk(
         fvdb.JaggedTensor(gt_ijk_t),
         voxel_sizes=VOXEL_SIZE,
-        origins=[0.0, 0.0, 0.0],
+        origins=grid_origin,
     )
-    input_grid = fvdb.GridBatch.from_ijk(
+    input_grid = fvdb.GridBatch()
+    input_grid.set_from_ijk(
         fvdb.JaggedTensor(input_ijk_t),
         voxel_sizes=VOXEL_SIZE,
-        origins=[0.0, 0.0, 0.0],
+        origins=grid_origin,
     )
 
     sample = {

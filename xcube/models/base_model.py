@@ -300,16 +300,22 @@ class BaseModel(pl.LightningModule):
         logger: bool = True,
         on_step: Optional[bool] = None,
         on_epoch: Optional[bool] = None,
+        batch_size: Optional[int] = None,
     ):
         """
         This overrides fixes if dict key is not a string...
         """
+        # batch_size is forwarded straight to Lightning's log_dict. Without it, Lightning tries
+        # to auto-infer the batch size by inspecting the batch dict for a plain tensor -- which
+        # fails (MisconfigurationException) for datasets like GPR whose batch only contains
+        # custom fvdb GridBatch/JaggedTensor objects, not plain tensors.
         dictionary = {
             prefix + "/" + str(k): v for k, v in dictionary.items()
         }
         self.log_dict(dictionary=dictionary,
                       prog_bar=prog_bar,
-                      logger=logger, on_step=on_step, on_epoch=on_epoch)
+                      logger=logger, on_step=on_step, on_epoch=on_epoch,
+                      batch_size=batch_size)
 
     def log_image(self, name: str, img, step: Optional[int] = None):
         if self.trainer.logger is not None:

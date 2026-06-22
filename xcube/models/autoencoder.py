@@ -148,28 +148,34 @@ class Model(BaseModel):
 
         out = {'idx': batch_idx}
         out = self(batch, out)
-        
+
         if out is None and not is_val:
             return None
 
-        loss_dict, metric_dict, latent_dict = self.loss(batch, out, 
-                                                        compute_metric=is_val, 
+        # Number of grids in this batch (e.g. 2, per gpr_vae.yaml's batch_size). Passed explicitly
+        # to every self.log/self.log_dict_prefix call below: without it, Lightning tries to
+        # auto-infer batch_size by inspecting the batch dict for a plain tensor, which fails for
+        # GPR since its batch only contains custom fvdb GridBatch/JaggedTensor objects.
+        log_batch_size = out['gt_grid'].grid_count
+
+        loss_dict, metric_dict, latent_dict = self.loss(batch, out,
+                                                        compute_metric=is_val,
                                                         global_step=self.global_step,
                                                         current_epoch=self.current_epoch)
 
         if not is_val:
-            self.log_dict_prefix('train_loss', loss_dict)
-            self.log_dict_prefix('train_loss', latent_dict)
+            self.log_dict_prefix('train_loss', loss_dict, batch_size=log_batch_size)
+            self.log_dict_prefix('train_loss', latent_dict, batch_size=log_batch_size)
             if self.hparams.enable_anneal:
-                self.log('anneal_kl_weight', self.loss.get_kl_weight(self.global_step))
+                self.log('anneal_kl_weight', self.loss.get_kl_weight(self.global_step), batch_size=log_batch_size)
         else:
-            self.log_dict_prefix('val_metric', metric_dict)
-            self.log_dict_prefix('val_loss', loss_dict)
-            self.log_dict_prefix('val_loss', latent_dict)
+            self.log_dict_prefix('val_metric', metric_dict, batch_size=log_batch_size)
+            self.log_dict_prefix('val_loss', loss_dict, batch_size=log_batch_size)
+            self.log_dict_prefix('val_loss', latent_dict, batch_size=log_batch_size)
 
         loss_sum = loss_dict.get_sum()
-        self.log('val_loss' if is_val else 'train_loss/sum', loss_sum)
-        self.log('val_step', self.global_step)
+        self.log('val_loss' if is_val else 'train_loss/sum', loss_sum, batch_size=log_batch_size)
+        self.log('val_step', self.global_step, batch_size=log_batch_size)
 
         return loss_sum
 
