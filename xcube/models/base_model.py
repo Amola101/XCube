@@ -253,7 +253,9 @@ class BaseModel(pl.LightningModule):
                 for metric_name, should_add_best in self.get_hparams_metrics():
                     hparams_metrics[metric_name] = 0.0
                     hparams_metrics[f'best/{metric_name}'] = 0.0
-                from pytorch_lightning.utilities.logger import (
+                # Original: from pytorch_lightning.utilities.logger import (_convert_params, _flatten_dict)
+                # Newer pytorch-lightning moved these two helpers to the lightning_fabric package instead.
+                from lightning_fabric.utilities.logger import (
                     _convert_params, _flatten_dict)
                 hparams_dict = _convert_params(self.hparams)
                 hparams_dict = _flatten_dict(hparams_dict)
