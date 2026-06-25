@@ -368,7 +368,11 @@ if __name__ == '__main__':
     # fix wandb global_step resume bug
     if program_args.resume:
         # get global step offset
-        checkpoint = torch.load(last_ckpt_path, map_location='cpu')
+        # Original: checkpoint = torch.load(last_ckpt_path, map_location='cpu')
+        # torch>=2.6 defaults weights_only=True, which blocks unpickling the OmegaConf
+        # hparams saved inside our own checkpoint (same fix as diffusion.py's VAE loader).
+        # Safe here: this is always our own locally-trained checkpoint, not a downloaded one.
+        checkpoint = torch.load(last_ckpt_path, map_location='cpu', weights_only=False)
         global_step_offset = checkpoint["global_step"]
         trainer.fit_loop.epoch_loop._batches_that_stepped = global_step_offset
         del checkpoint    
@@ -392,6 +396,15 @@ if __name__ == '__main__':
     """""""""""""""""""""""""""""""""""""""""""""""
     # Note: In debug mode, trainer.fit will automatically end if NaN occurs in backward.
     e = None
+    # When resuming (ckpt_path set below), Lightning internally calls torch.load on our
+    # checkpoint too. torch>=2.6 defaults weights_only=True there as well, which blocks
+    # the OmegaConf hparams stored inside -- same fix as above and as diffusion.py's VAE
+    # loader, just scoped around Lightning's own internal load this time.
+    _original_torch_load = torch.load
+    def _torch_load_trusted(*args, **kwargs):
+        kwargs.setdefault('weights_only', False)
+        return _original_torch_load(*args, **kwargs)
+    torch.load = _torch_load_trusted
     try:
         net_model.overfit_logger = OverfitLoggerNull()
         if program_args.validate_first:
@@ -412,6 +425,8 @@ if __name__ == '__main__':
             traceback.print_exc()
             if program_args.accelerator is None:
                 pdb.post_mortem(e.__traceback__)
+    finally:
+        torch.load = _original_torch_load
 
     """""""""""""""""""""""""""""""""""""""""""""""
     [6] If ended premature, add to delete list.
