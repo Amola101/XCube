@@ -14,6 +14,7 @@ import pickle
 import importlib
 from pathlib import Path
 
+import numpy as np
 import torch
 import matplotlib
 matplotlib.use('Agg')
@@ -60,23 +61,37 @@ with torch.no_grad():
         use_ddim=True, ddim_step=100, use_ema=False)
 pred_grid = res.structure_grid[0]
 
-def to_points(grid):
-    xyz = grid.grid_to_world(grid.ijk.float())
-    return xyz[0].jdata.cpu().numpy()
+def to_ijk(grid):
+    return grid.ijk[0].jdata.cpu().numpy()
 
-teunet_pts = to_points(teunet_grid)
-pred_pts = to_points(pred_grid)
-gt_pts = to_points(gt_grid)
+teunet_ijk = to_ijk(teunet_grid)
+pred_ijk = to_ijk(pred_grid)
+gt_ijk = to_ijk(gt_grid)
+
+# Shared bounding box (based on GT, which spans the full 64x64x48 grid) so all
+# three panels render at the same physical scale and are visually comparable.
+mins = gt_ijk.min(axis=0)
+maxs = gt_ijk.max(axis=0)
+shape = tuple(maxs - mins + 1)
+
+def to_dense(ijk):
+    arr = np.zeros(shape, dtype=bool)
+    local = ijk - mins
+    # TEUNet/prediction can occupy voxels slightly outside GT's own bounding
+    # box -- clip those out rather than crash, instead of assuming a perfect fit.
+    valid = np.all((local >= 0) & (local < np.array(shape)), axis=1)
+    local = local[valid]
+    arr[local[:, 0], local[:, 1], local[:, 2]] = True
+    return arr
 
 fig = plt.figure(figsize=(15, 5))
 titles = ['TEUNet Input (flawed)', 'XCube Stage 2 Output', 'Ground Truth']
-for i, (pts, title) in enumerate(zip([teunet_pts, pred_pts, gt_pts], titles)):
+for i, (ijk, title) in enumerate(zip([teunet_ijk, pred_ijk, gt_ijk], titles)):
     ax = fig.add_subplot(1, 3, i + 1, projection='3d')
-    ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=2)
-    ax.set_title(f'{title}\n({pts.shape[0]} voxels)')
-    ax.set_xlim(gt_pts[:, 0].min(), gt_pts[:, 0].max())
-    ax.set_ylim(gt_pts[:, 1].min(), gt_pts[:, 1].max())
-    ax.set_zlim(gt_pts[:, 2].min(), gt_pts[:, 2].max())
+    ax.voxels(to_dense(ijk), edgecolor='k', linewidth=0.1)
+    ax.set_title(f'{title}\n({ijk.shape[0]} voxels)')
+    ax.set_box_aspect(shape)
+    ax.view_init(elev=20, azim=-60)
 
 plt.suptitle(f'Sample: {stem}')
 plt.tight_layout()
