@@ -165,23 +165,82 @@ where TEUNet's reconstruction failed almost completely, leaving little for the
 diffusion model's conditioning signal to work from.
 
 This is a genuine negative result for the current setup, not yet a successful
-improvement over baseline. Worth investigating next: the diffuser network was
-deliberately minimal for a first working version (`model_channels=32`,
-`channel_mult=[1,2]`, `num_res_blocks=1`, no attention) — more capacity may be
-needed; the conditioning signal (TEUNet's grid encoded through the frozen VAE
-encoder, concatenated as extra channels) may be too coarse/lossy; and the
-training loss plateaued by ~epoch 25-30, which may indicate a capacity
-ceiling rather than an undertrained model.
+improvement over baseline.
+
+## Diagnosis (`scripts/test_vae_roundtrip.py`)
+
+To find the actual cause, ran a diagnostic: pass TEUNet's grid through the
+frozen Stage 1 VAE's encoder + decoder directly — zero noise, zero diffusion
+process at all — and compare to ground truth the same way.
+
+| Tier | TEUNet baseline | VAE round-trip only (no diffusion) | Full diffusion model |
+|---|---|---|---|
+| Good | 0.816 | 0.808 | 0.802 |
+| Moderate | 0.580 | 0.580 | 0.572 |
+| Poor | 0.085 | 0.088 | 0.090 |
+| **Overall** | **0.665** | **0.661** | **0.655** |
+
+**The VAE round-trip alone performs almost identically to the full trained
+diffusion model.** The diffusion process isn't doing meaningful denoising —
+it's behaving like it learned to mostly pass the condition straight through.
+
+Confirmed visually too (`scripts/visualize_stage2_sample.py`, now rendering
+actual solid voxel cubes instead of scattered dots — much clearer): on a
+poor-tier sample, TEUNet's input gets the pipe's right-hand section right but
+the left-hand section disintegrates into a scattered, broken cluster. The
+model's output keeps the good section, adds a modest number of voxels
+overall, but the broken left-hand section stays just as scattered — it never
+reorganizes that region into the smooth tube ground truth actually has.
+
+**Root-cause theory (structural confinement):** the VAE's decoder
+(`sunet.py:467-512`) grows structure level-by-level, only ever subdividing
+cells that are *already part of* the coarse footprint it's handed — it can
+never invent occupied space outside that starting footprint (like zooming
+into a map: you can add detail inside a region you're already looking at, but
+can't discover a city that wasn't on the map at all). During training,
+`extract_latent` always uses `DS.INPUT_PC` = ground truth (`input_key:
+"target_grid"`), so the model only ever practices "refine an already-correct
+neighborhood" — it never sees a *wrong* starting footprint during training.
+At real test time, the starting footprint instead comes from encoding
+TEUNet's own (possibly wrong) grid. On good/moderate tiers TEUNet's footprint
+roughly overlaps GT's, so this barely bites; on poor tier, where TEUNet's
+footprint diverges most, the model is structurally boxed into TEUNet's wrong
+neighborhood and can't escape it — matching the measured results exactly.
+
+**Two candidate fixes, not yet tried:**
+1. **Quick, no-retrain experiment**: at test time, dilate TEUNet's coarse
+   footprint (pad with a margin of neighboring cells) before passing it to
+   the decoder, giving it physical room to grow structure into gaps where
+   TEUNet broke down, rather than being boxed into exactly TEUNet's broken
+   shape. Cheap to test (a few lines in `run_stage2_inference.py`), no GPU
+   training needed.
+2. **The architecturally correct fix, needs retraining**: train using
+   TEUNet's (wrong) footprint as the structural starting point sometimes
+   too, not just GT's always-correct one — so the model actually practices
+   recovering from a wrong starting neighborhood instead of seeing one for
+   the first time at test. Requires changing the training data flow
+   (`diffusion.py`'s `extract_latent`/`forward`) and retraining Stage 2 from
+   scratch.
+
+(Separately, also worth trying: `use_classifier_free` is currently `false` in
+the config — enabling it randomly hides the conditioning signal during
+training ~10% of the time, which could counter a possible "shortcut" effect
+from concatenating TEUNet's hint very strongly at every denoising step. Not
+mutually exclusive with the structural-confinement fixes above.)
 
 ## Visualization (`scripts/visualize_stage2_sample.py`)
 
-Side-by-side 3D scatter plot (TEUNet input / model output / ground truth) for
-any chosen test sample, saved to `stage2_visual_comparison.png`. Shows the
-actual occupied-voxel point clouds and their counts.
+Side-by-side 3D **voxel-cube** rendering (TEUNet input / model output / ground
+truth) for any chosen test sample, saved to `stage2_visual_comparison.png`.
+Originally used scattered dots (`ax.scatter`), which made even the ground
+truth look like noise; switched to matplotlib's `ax.voxels()` to draw actual
+filled cubes per occupied cell, with a shared bounding box/scale and a fixed
+camera angle — now clearly shows real pipe shapes.
 
-## Status as of today
+## Status as of today (2026-06-25)
 
-Stage 1 and Stage 2 both trained and validated. Real inference confirmed
-working, with an encouraging (if small-sample) sign that the model helps most
-on the hardest cases. Not yet done: full 198-sample test-set evaluation for a
-statistically solid number; further visual/qualitative inspection.
+Stage 1 and Stage 2 both trained. Real inference and a full 198-sample
+evaluation confirmed Stage 2 does **not** yet beat the TEUNet baseline, and
+the VAE round-trip diagnostic + structural-confinement theory above explains
+why. Not yet done: trying either candidate fix (test-time dilation, or
+retraining with TEUNet's footprint included), and re-evaluating afterward.
