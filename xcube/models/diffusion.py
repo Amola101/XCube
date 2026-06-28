@@ -161,7 +161,19 @@ class Model(BaseModel):
         # for the main latent, then concatenating it onto the noisy latent.
         if not hasattr(self.hparams, 'use_cond_grid_concat_cond'):
             self.hparams.use_cond_grid_concat_cond = False
-            
+        # Structural-confinement fix (see PROGRESS.md): the decoder can only ever
+        # subdivide cells within the coarse footprint it starts from. Training
+        # always handed it GT's always-correct footprint, so it never practiced
+        # recovering from a wrong one -- a train/test mismatch confirmed by a
+        # dilation-only-at-test-time experiment that showed no improvement (the
+        # model never learned to use extra room productively). These two flags
+        # let training use TEUNet's (dilated, to give it room to work with)
+        # footprint as the structural starting point instead of GT's.
+        if not hasattr(self.hparams, 'train_cond_footprint'):
+            self.hparams.train_cond_footprint = False
+        if not hasattr(self.hparams, 'cond_grid_dilation_kernel'):
+            self.hparams.cond_grid_dilation_kernel = 1
+
         if not hasattr(self.hparams, 'use_class_cond'):
             self.hparams.use_class_cond = False
         if not hasattr(self.hparams, 'use_micro_cond'):
@@ -319,7 +331,15 @@ class Model(BaseModel):
     @torch.no_grad()
     def extract_latent(self, batch):
         return self.vae._encode(batch, use_mode=False)
-    
+
+    @torch.no_grad()
+    def encode_cond_grid(self, cond_grid):
+        # Shared by training (forward/_forward_cond) and real inference
+        # (evaluation_api) so the dilation amount is always applied consistently.
+        if self.hparams.cond_grid_dilation_kernel > 1:
+            cond_grid = cond_grid.conv_grid(self.hparams.cond_grid_dilation_kernel, 1)
+        return self.vae._encode({DS.INPUT_PC: cond_grid}, use_mode=True)
+
     def get_pos_embed(self, h):
         return h[:, :3]
     
@@ -441,8 +461,14 @@ class Model(BaseModel):
             # latent space as what we're denoising. use_mode=True means "use the VAE's
             # mean prediction, not a random sample", since we want a stable, repeatable
             # hint rather than fresh VAE sampling noise on top of the diffusion noise.
-            if batch is not None:
-                cond_latent = self.vae._encode({DS.INPUT_PC: batch[DS.COND_PC]}, use_mode=True)
+            # Original: if batch is not None: cond_latent = self.vae._encode({DS.INPUT_PC: batch[DS.COND_PC]}, use_mode=True) / else: cond_latent = cond_dict['cond_grid_latent']
+            # train_cond_footprint mode already computed this exact same encode in
+            # forward() (it needs it for the topology too) -- reuse it via cond_dict
+            # instead of paying for the VAE encode a second time every training step.
+            if cond_dict is not None and 'cond_grid_latent' in cond_dict:
+                cond_latent = cond_dict['cond_grid_latent']
+            elif batch is not None:
+                cond_latent = self.encode_cond_grid(batch[DS.COND_PC])
             else:
                 cond_latent = cond_dict['cond_grid_latent']
             # TEUNet's grid generally occupies different voxels than the GT grid we're
@@ -535,7 +561,20 @@ class Model(BaseModel):
     def forward(self, batch, out: dict):
         # first get latent from vae
         with torch.no_grad():
-            latents = self.extract_latent(batch)
+            # Original: latents = self.extract_latent(batch)
+            if self.hparams.train_cond_footprint:
+                # Structural-confinement fix: use TEUNet's (dilated) footprint as the
+                # structural starting point instead of GT's always-correct one, so the
+                # model practices recovering from the same kind of imperfect starting
+                # structure it faces at real test time. GT's true feature values are
+                # aligned onto that footprint (zero-filled wherever TEUNet's footprint
+                # doesn't reach) -- that aligned result is what actually gets noised.
+                cond_latent = self.encode_cond_grid(batch[DS.COND_PC])
+                gt_latent = self.extract_latent(batch)
+                aligned_feature = cond_latent.grid.fill_to_grid(gt_latent.feature, gt_latent.grid, 0.0)
+                latents = VDBTensor(cond_latent.grid, aligned_feature)
+            else:
+                latents = self.extract_latent(batch)
 
         # To Do: scale the latent
         if self.hparams.scale_by_std:
@@ -571,7 +610,11 @@ class Model(BaseModel):
         # Predict the noise residual and compute loss
         # forward_cond function use batch-level timesteps
         noisy_latents = VDBTensor(grid=latents.grid, feature=latents.grid.jagged_like(noisy_latents))
-        model_pred = self._forward_cond(noisy_latents, timesteps, batch)
+        # Original: model_pred = self._forward_cond(noisy_latents, timesteps, batch)
+        # Pass the cond_grid_latent computed above (if any) through cond_dict so
+        # _forward_cond doesn't redundantly re-encode the same TEUNet grid again.
+        precomputed_cond_dict = {'cond_grid_latent': cond_latent} if self.hparams.train_cond_footprint else None
+        model_pred = self._forward_cond(noisy_latents, timesteps, batch, cond_dict=precomputed_cond_dict)
 
         out.update({'pred': model_pred.feature.jdata})
         out.update({'target': target})
@@ -779,7 +822,8 @@ class Model(BaseModel):
             # Real Stage 2 use: no GT exists yet, so the condition must come from a
             # real TEUNet grid passed in via `batch`, not from a previous stage's result.
             if batch is not None:
-                cond_dict['cond_grid_latent'] = self.vae._encode({DS.INPUT_PC: batch[DS.COND_PC]}, use_mode=True)
+                # Original: cond_dict['cond_grid_latent'] = self.vae._encode({DS.INPUT_PC: batch[DS.COND_PC]}, use_mode=True)
+                cond_dict['cond_grid_latent'] = self.encode_cond_grid(batch[DS.COND_PC])
             else:
                 raise NotImplementedError("use_cond_grid_concat_cond needs a real TEUNet grid passed via `batch`")
 

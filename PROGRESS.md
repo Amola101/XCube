@@ -207,20 +207,63 @@ roughly overlaps GT's, so this barely bites; on poor tier, where TEUNet's
 footprint diverges most, the model is structurally boxed into TEUNet's wrong
 neighborhood and can't escape it — matching the measured results exactly.
 
-**Two candidate fixes, not yet tried:**
-1. **Quick, no-retrain experiment**: at test time, dilate TEUNet's coarse
-   footprint (pad with a margin of neighboring cells) before passing it to
-   the decoder, giving it physical room to grow structure into gaps where
-   TEUNet broke down, rather than being boxed into exactly TEUNet's broken
-   shape. Cheap to test (a few lines in `run_stage2_inference.py`), no GPU
-   training needed.
-2. **The architecturally correct fix, needs retraining**: train using
-   TEUNet's (wrong) footprint as the structural starting point sometimes
-   too, not just GT's always-correct one — so the model actually practices
-   recovering from a wrong starting neighborhood instead of seeing one for
-   the first time at test. Requires changing the training data flow
-   (`diffusion.py`'s `extract_latent`/`forward`) and retraining Stage 2 from
-   scratch.
+**Fix attempt 1 (tried 2026-06-27): test-time dilation — did not work.**
+`scripts/test_dilation_fix.py` dilates TEUNet's grid via fvdb's
+`GridBatch.conv_grid(kernel_size, stride=1)` before encoding/conditioning,
+giving the decoder a wider candidate region to grow structure into. Tested
+both a 1-voxel margin (`kernel_size=3`) and a 3-voxel margin (`kernel_size=7`)
+on the same 11-sample tier spread — neither changed results meaningfully
+(poor tier: 0.230 baseline vs 0.229 dilated at kernel=7; essentially flat
+across all tiers, no improvement at any margin tested).
+
+**Why this null result is itself informative**: it rules out "not enough
+room" as the mechanism, and sharpens the diagnosis — the model doesn't just
+need more space, it never learned *how* to use an uncertain/wide candidate
+region productively. It only ever practiced refining a region it could
+already trust was exactly correct (GT's). Given extra room at test time, it
+has no learned behavior for filling it in, so it mostly predicts "not
+occupied" regardless. This confirms the real fix has to change what the model
+practices on during training, not just what it's given at test time.
+
+**Fix attempt 2 (tried 2026-06-27/28): retrain on TEUNet's dilated footprint
+— also did NOT work.** Implemented in `xcube/models/diffusion.py`: new
+hparams `train_cond_footprint` and `cond_grid_dilation_kernel`, a shared
+`encode_cond_grid()` helper (dilates via `conv_grid` then encodes through the
+frozen VAE, used consistently in training and at real inference), and a new
+branch in `forward()` that uses the dilated-TEUNet encode as the structural
+topology + noising target (GT's true features aligned onto it via
+`fill_to_grid`) instead of GT's own footprint. New config
+`configs/gpr/gpr_diffusion_v2.yaml` (`cond_grid_dilation_kernel: 5`, ~2-voxel
+margin), trained 50 epochs on the full dataset (`checkpoints/gpr/Diffusion_stage2_v2/version_2`,
+val loss plateaued ~0.28-0.33, comparable to v1). Full 198-sample evaluation
+(`scripts/run_stage2_inference_v2.py`):
+
+| Tier | n | v2 IoU vs GT | TEUNet IoU vs GT | Diff |
+|---|---|---|---|---|
+| Good | 126 | 0.800 | 0.816 | -0.016 |
+| Moderate | 46 | 0.565 | 0.580 | -0.015 |
+| Poor | 26 | 0.089 | 0.085 | +0.004 |
+| **Overall** | **198** | **0.652** | **0.665** | **-0.013** |
+
+**Essentially identical to v1** (-0.010 → -0.013 overall, poor tier +0.004
+unchanged). Two structural-footprint fixes in a row (test-time dilation, and
+now retraining on a dilated footprint) produced no improvement at all.
+
+**Updated theory**: combined with the earlier VAE-round-trip finding (frozen
+VAE encode/decode alone, zero diffusion, already matches the full model's
+performance), the evidence now points less at "the decoder doesn't have
+enough room" and more at **the diffusion model learning to just pass the
+conditioning hint straight through rather than doing real generative
+correction** — changing the footprint doesn't matter if the model was never
+forced to rely on anything besides copying its hint in the first place.
+
+**Next, not yet tried**: enable `use_classifier_free: true` (already exists
+as an hparam, currently unused) and retrain. This randomly hides the
+conditioning signal during training (`classifier_free_prob`, default 0.1),
+forcing the model to sometimes denoise using only the latent space's learned
+shape distribution with no hint at all — which should discourage the
+copy-through shortcut if that's really what's happening. **Start here next
+session.**
 
 (Separately, also worth trying: `use_classifier_free` is currently `false` in
 the config — enabling it randomly hides the conditioning signal during

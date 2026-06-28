@@ -1,0 +1,82 @@
+include_configs:
+  - ../train/diffusion/diffusion_128x128x128_sparse.yaml
+  - gpr.yaml
+
+name: 'gpr/Diffusion_stage2_v2'
+
+# --- Stage 2 v2 (this config): same as gpr_diffusion.yaml, but fixes the
+# "structural confinement" issue found after evaluating v1 (see PROGRESS.md).
+# v1 always trained on GT's always-correct footprint and only saw TEUNet's
+# (sometimes wrong) footprint for the first time at test -- a train/test
+# mismatch. v2 trains on a DILATED version of TEUNet's footprint instead, so
+# the model practices recovering the true shape from an imperfect, wide
+# candidate region, matching what it actually faces at real test time.
+train_kwargs:
+  input_key: "target_grid"
+val_kwargs:
+  input_key: "target_grid"
+test_kwargs:
+  input_key: "target_grid"
+
+resolution: "0.005"
+
+vae_config: "/home/ameliacatala/Documents/XCube/configs/gpr/gpr_vae.yaml"
+vae_checkpoint: "/home/ameliacatala/Documents/checkpoints/gpr/VAE_stage1/version_4/checkpoints/last.ckpt"
+
+conditioning_key: "concat"
+use_cond_grid_concat_cond: true
+num_classes: 16
+
+# --- New in v2: train on TEUNet's dilated footprint instead of GT's. ---
+# kernel_size=5 means a ~2-voxel margin around TEUNet's occupied cells (see
+# xcube/models/diffusion.py's encode_cond_grid, uses fvdb's GridBatch.conv_grid).
+train_cond_footprint: true
+cond_grid_dilation_kernel: 5
+
+log_image: false
+
+ema: false
+scale_by_std: true
+use_ddim: true
+num_inference_steps: 100
+
+num_train_timesteps: 1000
+beta_start: 0.0001
+beta_end: 0.02
+beta_schedule: "linear"
+prediction_type: "epsilon"
+
+supervision:
+  mse_weight: 1.0
+
+optimizer: "Adam"
+learning_rate:
+  init: 5.0e-5
+  decay_mult: 1.0
+  decay_step: 2000000000
+  clip: 1.0e-6
+weight_decay: 0.0
+grad_clip: 0.5
+
+network:
+  diffuser_name: "UNetModel_Sparse"
+  diffuser:
+    dims: 3
+    image_size: [32, 32, 24]
+    model_channels: 32
+    use_middle_attention: false
+    channel_mult: [1, 2]
+    attention_resolutions: []
+    num_res_blocks: 1
+    num_heads: 4
+  scheduler:
+    num_train_timesteps: ${num_train_timesteps}
+    beta_start: ${beta_start}
+    beta_end: ${beta_end}
+    beta_schedule: ${beta_schedule}
+    variance_type: "fixed_small"
+    clip_sample: False
+    prediction_type: ${prediction_type}
+
+batch_size: 2
+train_val_num_workers: 4
