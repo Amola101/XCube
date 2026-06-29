@@ -257,13 +257,49 @@ conditioning hint straight through rather than doing real generative
 correction** — changing the footprint doesn't matter if the model was never
 forced to rely on anything besides copying its hint in the first place.
 
-**Next, not yet tried**: enable `use_classifier_free: true` (already exists
-as an hparam, currently unused) and retrain. This randomly hides the
-conditioning signal during training (`classifier_free_prob`, default 0.1),
-forcing the model to sometimes denoise using only the latent space's learned
-shape distribution with no hint at all — which should discourage the
-copy-through shortcut if that's really what's happening. **Start here next
-session.**
+**Fix attempt 3 (tried 2026-06-28/29): classifier-free conditioning dropout
+— also did NOT meaningfully change anything.** `use_classifier_free` and
+`classifier_free_prob` already existed as hparams (unused before); the
+dropout mechanism (`conduct_classifier_free`) was already fully wired into
+the `use_cond_grid_concat_cond` branch. New config
+`configs/gpr/gpr_diffusion_v3.yaml` (built on v1's plain footprint, not v2's
+dilated one, to isolate dropout as the only new variable), trained 50 epochs
+full dataset (`checkpoints/gpr/Diffusion_stage2_v3/version_0`, val loss
+plateau ~0.30-0.34, same range as v1/v2). Full 198-sample evaluation
+(`scripts/run_stage2_inference_v3.py`):
+
+| Tier | n | v3 IoU vs GT | TEUNet IoU vs GT | Diff |
+|---|---|---|---|---|
+| Good | 126 | 0.806 | 0.816 | -0.010 |
+| Moderate | 46 | 0.570 | 0.580 | -0.010 |
+| Poor | 26 | 0.090 | 0.085 | +0.005 |
+| **Overall** | **198** | **0.657** | **0.665** | **-0.008** |
+
+**The real finding now is the consistency itself**: three structurally
+different fixes (test-time dilation, retraining on a dilated footprint,
+classifier-free dropout) all land within noise of each other (-0.010, -0.013,
+-0.008 overall; poor tier always +0.004 to +0.005). None of our three
+theories about the specific mechanism turned out to be the deciding factor.
+This looks less like "haven't found the right tweak" and more like this
+conditioning setup (concat-based, single frozen-VAE encode of TEUNet's grid,
+small network: `model_channels=32`, `channel_mult=[1,2]`, `num_res_blocks=1`,
+no attention) has a real ceiling around 0.65-0.66 overall IoU — just shy of
+TEUNet's own baseline — regardless of these three training-time
+interventions.
+
+**Not yet tried, would need a genuinely different angle rather than another
+training-time tweak**:
+- Increase network capacity (more channels/res blocks/attention) — current
+  network is deliberately tiny (scaled down from XCube's Waymo-scale
+  defaults); it's possible it's simply too small to learn anything beyond
+  near-copy-through, independent of training regime.
+- Reconsider whether per-voxel IoU vs. TEUNet is even the right comparison —
+  TEUNet's own reconstruction is itself a strong, already-trained baseline;
+  beating it on the same input information may require the diffusion model
+  to access something TEUNet doesn't (e.g. the raw GPR scan itself, not just
+  TEUNet's already-collapsed binary/probability grid).
+- Try a fundamentally different conditioning mechanism (e.g. cross-attention
+  instead of channel-concat) rather than another concat-based variant.
 
 (Separately, also worth trying: `use_classifier_free` is currently `false` in
 the config — enabling it randomly hides the conditioning signal during

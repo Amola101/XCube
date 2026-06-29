@@ -1,0 +1,88 @@
+include_configs:
+  - ../train/diffusion/diffusion_128x128x128_sparse.yaml
+  - gpr.yaml
+
+name: 'gpr/Diffusion_stage2_v3'
+
+# --- Stage 2 v3 (this config): tests a different theory than v2 did. v1/v2
+# both changed *what footprint* the model trains on (GT's vs TEUNet's,
+# dilated or not) -- neither changed the result at all, which pointed away
+# from "not enough room" and toward "the model just learned to copy its
+# conditioning hint straight through" (consistent with the VAE round-trip
+# diagnostic: skipping diffusion entirely gives nearly the same result as
+# the full trained model). v3 tests that copy-through theory directly: with
+# use_classifier_free enabled, the conditioning hint is randomly zeroed out
+# for ~10% of training batches (classifier_free_prob, see
+# xcube/models/diffusion.py's conduct_classifier_free), forcing the model to
+# sometimes reconstruct a shape with no hint to copy at all.
+train_kwargs:
+  input_key: "target_grid"
+val_kwargs:
+  input_key: "target_grid"
+test_kwargs:
+  input_key: "target_grid"
+
+resolution: "0.005"
+
+vae_config: "/home/ameliacatala/Documents/XCube/configs/gpr/gpr_vae.yaml"
+vae_checkpoint: "/home/ameliacatala/Documents/checkpoints/gpr/VAE_stage1/version_4/checkpoints/last.ckpt"
+
+conditioning_key: "concat"
+use_cond_grid_concat_cond: true
+num_classes: 16
+
+# --- New in v3: force the model to sometimes generate with no hint at all. ---
+use_classifier_free: true
+classifier_free_prob: 0.1
+
+# train_cond_footprint left at its default (false) -- v2 already showed dilating
+# the footprint made no difference, so we're back to GT's footprint here to
+# isolate classifier-free dropout as the only new variable in this experiment.
+
+log_image: false
+
+ema: false
+scale_by_std: true
+use_ddim: true
+num_inference_steps: 100
+
+num_train_timesteps: 1000
+beta_start: 0.0001
+beta_end: 0.02
+beta_schedule: "linear"
+prediction_type: "epsilon"
+
+supervision:
+  mse_weight: 1.0
+
+optimizer: "Adam"
+learning_rate:
+  init: 5.0e-5
+  decay_mult: 1.0
+  decay_step: 2000000000
+  clip: 1.0e-6
+weight_decay: 0.0
+grad_clip: 0.5
+
+network:
+  diffuser_name: "UNetModel_Sparse"
+  diffuser:
+    dims: 3
+    image_size: [32, 32, 24]
+    model_channels: 32
+    use_middle_attention: false
+    channel_mult: [1, 2]
+    attention_resolutions: []
+    num_res_blocks: 1
+    num_heads: 4
+  scheduler:
+    num_train_timesteps: ${num_train_timesteps}
+    beta_start: ${beta_start}
+    beta_end: ${beta_end}
+    beta_schedule: ${beta_schedule}
+    variance_type: "fixed_small"
+    clip_sample: False
+    prediction_type: ${prediction_type}
+
+batch_size: 2
+train_val_num_workers: 4
