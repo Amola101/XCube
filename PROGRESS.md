@@ -3,27 +3,33 @@
 ## Goal
 
 A conditional diffusion model that denoises random noise into the correct
-ground-truth (GT) tube/pipe shape, conditioned on TEUNet's flawed reconstruction
-of the same subsurface GPR scan. Two stages:
+ground-truth (GT) tube/pipe shape, conditioned on an upstream model's flawed
+reconstruction of the same subsurface GPR scan. Two stages:
 
 - **Stage 1**: a VAE learns a latent space of real tube geometry by
   self-reconstructing GT shapes.
 - **Stage 2**: a conditional diffusion model denoises into that latent space,
-  conditioned on TEUNet's (imperfect) output.
+  conditioned on the upstream model's (imperfect) output.
 
 The research theme specifically calls for diffusion rather than plain
 regression, since regression tends to average over multiple plausible
 corrections into one blurry compromise, while diffusion can commit to one
 sharp, plausible answer per sample.
 
-## Source data
+**This file is split into two parts by data source, because they behave
+differently and should not be conflated:**
 
-`/home/ameliacatala/Documents/preprocess/transfer_data/{teunet,gt}/` — 1973
-paired patches (TEUNet probability grid + binary GT grid), 64x64x48 voxels,
-~5mm resolution. Dice score distribution: good (>0.8): 1257, moderate
-(0.5-0.8): 455, poor (<0.5): 261.
+- **Part 1 (archived)** — the original TEUNet dataset. No longer in use as of
+  2026-07-07. Kept as a full record of 6 fix attempts and why they were
+  abandoned, but nothing in Part 1 should be assumed to carry over to Part 2
+  without separately checking it.
+- **Part 2 (current/active)** — the corr_medium/Step1 dataset. This is the
+  dataset and checkpoints actually in use now. **Read this part first** for
+  current status.
 
 ## Environment setup
+
+(Applies to both parts — general project environment, not data-specific.)
 
 - Working conda env: **`preproc`** (not `base`, not `gpr310` — those had an
   unrelated PyPI package literally named `fvdb`, a FAISS-based vector DB tool,
@@ -45,6 +51,35 @@ paired patches (TEUNet probability grid + binary GT grid), 64x64x48 voxels,
   set manually per command.
 - CUDA 12.4 JIT compilation needs `PATH=/usr/local/cuda-12.4/bin:$PATH` and
   `CPATH=/usr/local/cuda-12.4/targets/x86_64-linux/include:$CPATH`.
+- **As of ~2026-07-08**: the JIT CUDA extension build (`ext/common`, used by
+  `color_util.py`) started failing with `nvcc` rejecting the conda env's own
+  bundled `gcc` (14.3.0 — CUDA 12.4 supports up to 13) as the host compiler,
+  even though a working cached `.so` already existed. Root cause not fully
+  pinned down, but coincides with the shared machine's disk-space issue being
+  resolved by another user (see the aside at the bottom of this file) —
+  possibly a system change invalidated cached intermediate build objects.
+  **Fixed by forcing `CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12`** (system
+  compilers, CUDA-12.4-compatible) when invoking `train.py`. Needed for any
+  training run on this machine going forward.
+
+---
+
+# PART 1 — TEUNet era (ARCHIVED, no longer in use)
+
+> **Everything in this part uses the original TEUNet dataset, which was
+> retired 2026-07-07 in favor of corr_medium/Step1 (Part 2).** This part is
+> kept as a complete record of what was tried and why it was abandoned — 6
+> fix attempts, a full poor-tier visual audit, and a firm "informational
+> bottleneck" diagnosis. **Do not treat conclusions here as automatically
+> true for Step1 data** — when checked directly (Part 2), Step1's own failure
+> modes turned out to look meaningfully different from TEUNet's.
+
+## Source data (TEUNet)
+
+`/home/ameliacatala/Documents/preprocess/transfer_data/{teunet,gt}/` — 1973
+paired patches (TEUNet probability grid + binary GT grid), 64x64x48 voxels,
+~5mm resolution. Dice score distribution: good (>0.8): 1257, moderate
+(0.5-0.8): 455, poor (<0.5): 261.
 
 ## Preprocessing (`datagen/preprocess_gpr.py`)
 
@@ -118,7 +153,7 @@ neither cleanly mapping to "GT is the target, TEUNet is a separate hint." Fix:
   deep inside the pytorch-lightning library). Safe since it's always our own
   locally-trained checkpoint, never a downloaded one.
 
-### Training results
+### v1 training results
 
 Ran in two stages (50 epochs, then resumed to 100) on the full dataset:
 
@@ -183,6 +218,8 @@ process at all — and compare to ground truth the same way.
 **The VAE round-trip alone performs almost identically to the full trained
 diffusion model.** The diffusion process isn't doing meaningful denoising —
 it's behaving like it learned to mostly pass the condition straight through.
+**This finding turned out to generalize beyond TEUNet — see Part 2's fix
+attempt 1, where the same signature reappeared on Step1 data.**
 
 Confirmed visually too (`scripts/visualize_stage2_sample.py`, now rendering
 actual solid voxel cubes instead of scattered dots — much clearer): on a
@@ -207,7 +244,8 @@ roughly overlaps GT's, so this barely bites; on poor tier, where TEUNet's
 footprint diverges most, the model is structurally boxed into TEUNet's wrong
 neighborhood and can't escape it — matching the measured results exactly.
 
-**Fix attempt 1 (tried 2026-06-27): test-time dilation — did not work.**
+## TEUNet fix attempt 1 (tried 2026-06-27): test-time dilation — did not work
+
 `scripts/test_dilation_fix.py` dilates TEUNet's grid via fvdb's
 `GridBatch.conv_grid(kernel_size, stride=1)` before encoding/conditioning,
 giving the decoder a wider candidate region to grow structure into. Tested
@@ -225,17 +263,18 @@ has no learned behavior for filling it in, so it mostly predicts "not
 occupied" regardless. This confirms the real fix has to change what the model
 practices on during training, not just what it's given at test time.
 
-**Fix attempt 2 (tried 2026-06-27/28): retrain on TEUNet's dilated footprint
-— also did NOT work.** Implemented in `xcube/models/diffusion.py`: new
-hparams `train_cond_footprint` and `cond_grid_dilation_kernel`, a shared
-`encode_cond_grid()` helper (dilates via `conv_grid` then encodes through the
-frozen VAE, used consistently in training and at real inference), and a new
-branch in `forward()` that uses the dilated-TEUNet encode as the structural
-topology + noising target (GT's true features aligned onto it via
-`fill_to_grid`) instead of GT's own footprint. New config
-`configs/gpr/gpr_diffusion_v2.yaml` (`cond_grid_dilation_kernel: 5`, ~2-voxel
-margin), trained 50 epochs on the full dataset (`checkpoints/gpr/Diffusion_stage2_v2/version_2`,
-val loss plateaued ~0.28-0.33, comparable to v1). Full 198-sample evaluation
+## TEUNet fix attempt 2 (tried 2026-06-27/28): retrain on TEUNet's dilated footprint — also did NOT work
+
+Implemented in `xcube/models/diffusion.py`: new hparams `train_cond_footprint`
+and `cond_grid_dilation_kernel`, a shared `encode_cond_grid()` helper (dilates
+via `conv_grid` then encodes through the frozen VAE, used consistently in
+training and at real inference), and a new branch in `forward()` that uses
+the dilated-TEUNet encode as the structural topology + noising target (GT's
+true features aligned onto it via `fill_to_grid`) instead of GT's own
+footprint. New config `configs/gpr/gpr_diffusion_v2.yaml`
+(`cond_grid_dilation_kernel: 5`, ~2-voxel margin), trained 50 epochs on the
+full dataset (`checkpoints/gpr/Diffusion_stage2_v2/version_2`, val loss
+plateaued ~0.28-0.33, comparable to v1). Full 198-sample evaluation
 (`scripts/run_stage2_inference_v2.py`):
 
 | Tier | n | v2 IoU vs GT | TEUNet IoU vs GT | Diff |
@@ -257,11 +296,11 @@ conditioning hint straight through rather than doing real generative
 correction** — changing the footprint doesn't matter if the model was never
 forced to rely on anything besides copying its hint in the first place.
 
-**Fix attempt 3 (tried 2026-06-28/29): classifier-free conditioning dropout
-— also did NOT meaningfully change anything.** `use_classifier_free` and
-`classifier_free_prob` already existed as hparams (unused before); the
-dropout mechanism (`conduct_classifier_free`) was already fully wired into
-the `use_cond_grid_concat_cond` branch. New config
+## TEUNet fix attempt 3 (tried 2026-06-28/29): classifier-free conditioning dropout — also did NOT meaningfully change anything
+
+`use_classifier_free` and `classifier_free_prob` already existed as hparams
+(unused before); the dropout mechanism (`conduct_classifier_free`) was
+already fully wired into the `use_cond_grid_concat_cond` branch. New config
 `configs/gpr/gpr_diffusion_v3.yaml` (built on v1's plain footprint, not v2's
 dilated one, to isolate dropout as the only new variable), trained 50 epochs
 full dataset (`checkpoints/gpr/Diffusion_stage2_v3/version_0`, val loss
@@ -287,10 +326,16 @@ no attention) has a real ceiling around 0.65-0.66 overall IoU — just shy of
 TEUNet's own baseline — regardless of these three training-time
 interventions.
 
-**Fix attempt 4 (tried 2026-06-30): free structural generation at inference
-— catastrophic failure, IoU ≈ 0.** Implemented in
-`scripts/run_stage2_inference_v4.py` (uses the v1 checkpoint, no
-retraining). Instead of encoding TEUNet's grid and passing its topology as
+**Note (important context, understood only later — see Part 2): this
+dropout trains "generate a pipe from nothing," a different skill from
+"given a wrong-but-present hint, fix it."** It never actually confronted the
+network with a hint that was *present but untrustworthy* — exactly the
+situation the corrupted-conditioning idea in Part 2 targets directly.
+
+## TEUNet fix attempt 4 (tried 2026-06-30): free structural generation at inference — catastrophic failure, IoU ≈ 0
+
+Implemented in `scripts/run_stage2_inference_v4.py` (uses the v1 checkpoint,
+no retraining). Instead of encoding TEUNet's grid and passing its topology as
 `grids`, manually constructs a fully-dense coarse grid matching the VAE's
 bottom level (`feat_depth = tree_depth-1 = 1`, `gap_stride = 2`,
 `voxel_bound = [32, 32, 24]`, `voxel_sizes = voxel_size * gap_stride`,
@@ -313,12 +358,13 @@ pruning and activates every voxel. This definitively rules out structural
 confinement as the fixable bottleneck — the model had full freedom and
 performed catastrophically worse, not better.
 
-## Poor-Tier Visual Audit (2026-07-02)
+## Poor-Tier Visual Audit — TEUNet data (2026-07-02)
 
 All 26 poor-tier test samples (indices 172–197) rendered side-by-side
 (TEUNet input / v1 model output / ground truth) in four batches saved to
 `~/Documents/poor_batch{1-4}_*.png`. Four distinct failure patterns
-identified:
+identified — **these "Pattern A-D" labels are specific to TEUNet's failure
+modes; do not assume they describe Step1's data (they don't — see Part 2)**:
 
 **Pattern A — Complete spatial miss (IoU = 0.000): 10 of 26 samples (38%)**
 TEUNet places voxels in entirely the wrong physical location or finds
@@ -352,9 +398,11 @@ that conditions only on TEUNet's output — there is no information in the
 conditioning signal about where the pipe is. Patterns B and D suggest the
 bottleneck is shape/topology learning capacity. Only Pattern C shows the
 model can do anything useful. Accessing pre-TEUNet signal (raw GPR scan or
-intermediate representation) is the only realistic path to fixing Pattern A.
+intermediate representation) is the only realistic path to fixing Pattern A
+— **this specific hope is what motivated requesting corr_medium; see Part 2
+for how that actually turned out.**
 
-## Visualization scripts
+## Visualization scripts (TEUNet era)
 
 | Script | Purpose |
 |---|---|
@@ -365,14 +413,13 @@ intermediate representation) is the only realistic path to fixing Pattern A.
 All use matplotlib `ax.voxels()` for filled-cube rendering with a shared
 bounding box from GT and a fixed camera angle (elev=20, azim=-60).
 
-## Capacity test (tried 2026-07-03): bigger network, still no improvement
+## TEUNet fix attempt 5 (tried 2026-07-03): bigger network (capacity) — still no improvement
 
-Tested the "network is too small" theory from the earlier "not yet tried"
-list: `configs/gpr/gpr_diffusion_v4.yaml` keeps v1's plain GT footprint (no
-dilation, no classifier-free dropout, no attention) but quadruples rough
-capacity — `model_channels` 32→64, one more depth level (`channel_mult`
-[1,2]→[1,2,4]), `num_res_blocks` 1→2. Trained 50 epochs (`batch_size: 2`,
-~19hr on the RTX 2000 Ada). Full 198-sample eval
+Tested the "network is too small" theory: `configs/gpr/gpr_diffusion_v4.yaml`
+keeps v1's plain GT footprint (no dilation, no classifier-free dropout, no
+attention) but quadruples rough capacity — `model_channels` 32→64, one more
+depth level (`channel_mult` [1,2]→[1,2,4]), `num_res_blocks` 1→2. Trained 50
+epochs (`batch_size: 2`, ~19hr on the RTX 2000 Ada). Full 198-sample eval
 (`scripts/results/stage2_full_test_v4capacity_198samples.txt`):
 
 | Tier | n | v4-capacity IoU vs GT | TEUNet IoU vs GT | Diff |
@@ -402,7 +449,7 @@ confirms the gaps are too large/structurally different for cheap geometric
 cleanup, consistent with an information gap rather than a fixable shape
 defect.
 
-## Fix attempt 6 (tried 2026-07-06): hardness-based loss reweighting — also did NOT help
+## TEUNet fix attempt 6 (tried 2026-07-06): hardness-based loss reweighting — also did NOT help
 
 Theory: with every training sample weighted equally, the ~64% "good" tier
 (where blind copy-through of TEUNet's hint is already near-optimal)
@@ -438,7 +485,7 @@ that TEUNet's signal genuinely contains no recoverable information for
 those cases, so no amount of training emphasis can manufacture a correction
 signal that isn't there.
 
-## Status as of today (2026-07-06)
+## TEUNet era conclusion (status as of 2026-07-06)
 
 Six fix attempts completed (three training-regime variants, one structural
 free-gen experiment, one capacity increase, one loss-reweighting) plus a
@@ -447,30 +494,42 @@ training variants land at or below the ~0.65-0.66 ceiling, just shy of
 TEUNet's own 0.665 baseline, and the post-processing test rules out cheap
 geometric cleanup too. Combined with the audit finding 38% of poor-tier
 samples are complete spatial misses with zero recoverable signal, the
-conclusion holds firmly: the bottleneck is informational, not architectural,
+conclusion held firmly: the bottleneck is informational, not architectural,
 training-regime, loss-weighting, or post-processing based.
 
-**Waiting on**: raw GPR scan data access (pre-TEUNet signal), expected
-~2026-07-05. This is the prerequisite for any meaningful next attempt on
-Pattern A (complete miss) samples, which make up the largest fraction of
-poor-tier failures. No further training-time or architecture tweaks are
-worth trying against TEUNet's output alone until that data lands.
+**This is where TEUNet-data work stopped.** The team requested raw GPR scan
+access (pre-TEUNet signal) as the one remaining untried angle. What actually
+arrived in response is a different dataset from a different upstream model
+(Step1/corr_medium) — not raw signal, and not TEUNet. See Part 2.
 
-**Update (2026-07-09): the true raw signal would be the A-scan** (the raw
-GPR waveform, pre-*any* neural network) — but the data owner declined to
-provide A-scan access, for reasons not stated to us. What was provided
-instead, below, is another model's (Step1's) processed predictions, not the
-raw signal. This matters: it means the original hypothesis behind this whole
-data request — that Pattern A misses are fixable given access to genuinely
-raw, pre-model information — remains untested. corr_medium is a real new
-data source and worth trying, but it does not by itself resolve the
-information-gap diagnosis; see the in-distribution caveat below.
+---
+
+# PART 2 — Step1/corr_medium era (CURRENT, active dataset)
+
+> **This is the dataset and checkpoints in active use.** TEUNet (Part 1) is
+> retired. Fix attempts here are numbered fresh (Step1 fix attempt 1, 2, ...)
+> — separately from Part 1's 6 TEUNet attempts — specifically so the two
+> don't get conflated. As of this writing, only 2 fix attempts have actually
+> been tried on this data (material conditioning, corrupted conditioning);
+> none of Part 1's dilation/capacity/reweighting fixes have been re-tested
+> here, and shouldn't be assumed to transfer.
+
+## Why the switch: A-scan access declined, corr_medium arrived instead
+
+The team's request (end of Part 1) was for **raw GPR scan access** — the
+true rawest signal here would be the **A-scan** (the raw radar waveform,
+pre-*any* neural network). **The data owner declined to provide A-scan
+access, for reasons not stated.** This request is considered closed —
+not a live option going forward.
+
+What arrived instead (2026-07-07) was `corr_medium`: a GT/prediction pair
+from a **Step1 model** — a different, earlier-pipeline-stage model, not
+TEUNet, and not raw signal. It's another model's processed output, same
+category of thing as TEUNet's output was, just from a different model and a
+different (larger, differently-balanced) sample set.
 
 ## New data source: corr_medium Step1 predictions (arrived 2026-07-07)
 
-Requested as the raw-GPR-signal data; what actually landed was a GT/prediction
-pair from a **Step1 model** (a different, earlier-pipeline-stage model — not
-TEUNet, and not the raw A-scan — see note above):
 `corr_medium_gt_voxel_radius.h5` and `corr_medium_step1_pred_voxel_radius.h5`,
 10,000 paired samples, in
 `/home/ameliacatala/Documents/corr_medium_gt_voxel_radius/`.
@@ -510,57 +569,39 @@ Tier breakdown — notably different balance from the original TEUNet dataset:
 Poor tier is far smaller proportionally here (1.3% vs. 13.2%).
 
 **Important caveat (from `README_corr_medium_voxel_radius.md`, packaged with
-the source data): this is NOT the hoped-for harder/OOD signal.** The dataset
-is explicitly medium-difficulty and **in-distribution** relative to the Step1
+the source data): this is NOT a harder/OOD signal.** The dataset is
+explicitly medium-difficulty and **in-distribution** relative to the Step1
 model's own training set (checkpoint `gpr_topo_step1/runs/real_v9/best.pt`) —
 the README states plainly: *"the prediction quality is expected to look
 strong. A diffusion model may not necessarily improve these results much."*
-So the small poor-tier share above likely reflects a curated, easier subset,
-**not** evidence that this Step1 model is a fundamentally richer signal than
-TEUNet for the hard Pattern-A (complete spatial miss) cases this project
-actually needs solved. The README also names two specific known failure
-modes in this data — pipes near a patch's bottom sometimes missed entirely,
-and pipes cut by the patch boundary becoming poor-quality half-pipes — both
-flagged as likely hard for a diffusion model to fix too.
+The README also names two specific known failure modes in this data — pipes
+near a patch's bottom sometimes missed entirely, and pipes cut by the patch
+boundary becoming poor-quality half-pipes.
 
-The README also documents two per-voxel fields present in both H5 files but
-**not currently used** by the preprocessing script: `radius_m` (physical pipe
-radius per voxel, float16, zero outside `pipe_mask`) and `material` (pipe
-material class per voxel, int16, `-1` outside `pipe_mask`). Both are ignored
-because the existing `.pkl` schema (`target_grid`/`input_grid`/`input_prob`),
-inherited unchanged from the TEUNet pipeline, has no field for them — using
-them would require extending the schema and the Stage 1/2 models themselves.
+The README also documents two per-voxel fields present in both H5 files:
+`radius_m` (physical pipe radius per voxel) and `material` (pipe material
+class per voxel). `radius_m` was skipped (`pipe_mask` is already a
+radius-expanded mask, so it's largely redundant with occupancy shape);
+`material` became the material-conditioning fix attempt below.
 
-**Next step**: given the in-distribution caveat, treat this dataset as a
-useful additional training/validation source rather than a confirmed fix for
-Pattern-A failures. Worth checking whether the source data can also provide a
-genuinely harder/OOD split before concluding it addresses the poor-tier
-information gap identified earlier.
-
-**Verified 2026-07-08**: checked a random 200-sample subset directly -- worst
+**Verified 2026-07-08**: checked a random 200-sample subset directly — worst
 Dice was 0.39, zero samples at exactly 0.000, consistent with the README's
-overall worst of 0.234. Confirms no Pattern-A-style complete misses in this
-dataset (unlike the original TEUNet data).
+overall worst of 0.234. **Confirms no TEUNet-style "Pattern A" complete
+misses in this dataset** — Step1's failure modes are categorically
+different from TEUNet's (further confirmed visually below).
 
 ## Material conditioning (implemented 2026-07-08)
 
 `corr_medium`'s H5 files also carry a per-voxel `material` class (int16, `-1`
-outside `pipe_mask`; observed classes `{0,1,2,3}` across GT+prediction). A
-third field, `radius_m`, was considered but skipped: `pipe_mask` is already a
-radius-expanded mask, so `radius_m` is largely redundant with occupancy shape
--- `material` is the genuinely new signal, useful for tasks like Pattern-C
-fragment consolidation (matching fragments by material continuity), though it
-does **not** address Pattern-A complete misses (both `radius_m` and
-`material` are undefined outside `pipe_mask`, so there's still nothing to
-condition on where the prediction found zero voxels).
+outside `pipe_mask`; observed classes `{0,1,2,3}` across GT+prediction).
 
 **Key finding that reshaped the implementation**: traced how conditioning
-actually reaches the model and found `confidence`/`input_prob` -- present
-since the original pipeline -- was **never actually consumed**. It's wired
-through `DS.INPUT_INTENSITY`, gated by VAE hparam `use_input_intensity`
+actually reaches the model and found `confidence`/`input_prob` — present
+since the original TEUNet-era pipeline — was **never actually consumed**. It's
+wired through `DS.INPUT_INTENSITY`, gated by VAE hparam `use_input_intensity`
 (`false` in `gpr_vae.yaml`), and even when enabled, Stage 2's
 `encode_cond_grid()` (which reuses the **frozen** Stage 1 VAE encoder to
-encode the conditioning grid) never passed intensity data to it at all --
+encode the conditioning grid) never passed intensity data to it at all —
 only grid positions. This meant the frozen encoder's first layer (`mix_fc`)
 was never trained to accept any extra per-voxel channel, so material
 conditioning requires retraining Stage 1's encoder with the new input
@@ -575,7 +616,7 @@ Mirrors the existing `use_input_semantic` pattern in
 a learned `nn.Embedding`, concatenated onto the position-embedded features
 before `mix_fc`) rather than one-hot encoding manually.
 
-- `xcube/data/base.py`: two new `DatasetSpec` entries --
+- `xcube/data/base.py`: two new `DatasetSpec` entries —
   `INPUT_MATERIAL` (aligned with whatever `INPUT_PC` currently is: GT's
   material when `input_key="target_grid"`, the Step1 prediction's material
   otherwise) and `COND_MATERIAL` (always the Step1 prediction's material,
@@ -596,49 +637,181 @@ before `mix_fc`) rather than one-hot encoding manually.
   `train_cond_footprint` branch, `evaluation_api`) updated; `get_dataset_spec`
   requests `DS.COND_MATERIAL` when the flag is set.
 - `datagen/preprocess_gpr_corr_medium.py`: `build_sample()` now also extracts
-  `target_material` (GT's material at GT-occupied voxels) and
-  `input_material` (Step1 prediction's material at its occupied voxels),
-  stored as `int8` (only 4 classes -- keeps the dataset small; grew from 6.7G
-  to 7.0G for all 10,000 samples). Regenerated the full dataset with this
-  field 2026-07-08.
+  `target_material` and `input_material`, stored as `int8`.
 - New configs: `configs/gpr/gpr_vae_corr_medium.yaml` (Stage 1, retrained on
-  corr_medium instead of the original 1973-sample TEUNet/GT set,
-  `use_input_material: true`, `num_material: 4`, `dim_material: 8`) and
-  `configs/gpr/gpr_diffusion_v6_material.yaml` (Stage 2, `use_cond_material:
-  true`, otherwise v1's plain architecture/footprint -- isolates material
-  conditioning as the one new variable on top of the new dataset).
+  corr_medium, `use_input_material: true`, `num_material: 4`,
+  `dim_material: 8`) and `configs/gpr/gpr_diffusion_v6_material.yaml`
+  (Stage 2, `use_cond_material: true`, otherwise v1's plain
+  architecture/footprint).
 
-Smoke-tested (5 train / 2 val batches) before committing to the full run --
-material embedding shapes align correctly, loss decreases normally, no
-crashes.
+## Stage 1 VAE retrain: corr_medium + material (finished 2026-07-09)
 
-**Unrelated environment fix needed along the way**: the JIT CUDA extension
-build (`ext/common`, used by `color_util.py`) started failing with `nvcc`
-rejecting the conda env's own bundled `gcc` (14.3.0 -- CUDA 12.4 supports up
-to 13) as the host compiler, even though a working cached `.so` already
-existed. Root cause not fully pinned down, but coincides with the shared
-machine's disk-space issue being resolved by another user (see below) --
-possibly a system change invalidated cached intermediate build objects.
-Fixed by forcing `CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12` (system compilers,
-CUDA-12.4-compatible) when invoking `train.py`. Needed for any future
-training run on this machine, not specific to material conditioning.
+`checkpoints/gpr/VAE_stage1_corr_medium/version_1`, 50 epochs on the full
+10,000-sample corr_medium dataset with material conditioning. Validation
+loss 0.85 → 0.31 (train 1.34 → 0.27), structure accuracy (finest tree level,
+`struct-acc-0`) 98.8% → 99.6%, still trending slightly at epoch 49 (not
+fully flattened like the original 100-epoch TEUNet-era Stage 1 run). The
+coarser tree level (`struct-acc-1`) sits at a trivial flat 100% throughout.
+Curve plots: `vae_stage1_corr_medium_training.png`.
 
-### Status as of 2026-07-08
+Reconstruction visuals (`scripts/visualize_vae_reconstruction.py`): clean
+white-background renders of one sample's ground-truth input, the VAE's
+actual latent embedding (16-dim per voxel, PCA→RGB via HSV mapping so it
+stays bright/readable rather than muddy), the coarse depth-1 structure, and
+the final depth-0 reconstruction — `vae_reconstruction_{before,embedding,
+during,after}.png` plus a combined `vae_reconstruction_visual.png`.
+Reconstruction closely matches the input, consistent with measured accuracy.
 
-Stage 1 retrain running in the user's own terminal (not backgrounded by
-Claude this time), **50 epochs** (not 100 -- the original Stage 1 run's 100
-epochs was overkill; the loss curve had already flattened well before that,
-and 50 was judged sufficient here), `--wname corr_medium_material_50ep`, log
-at `~/vae_corr_medium_material_50ep.log`. Measured smoke-test rate (~3.3 it/s,
-4,501 steps/epoch) gives an estimate of **~19 hours total** (~22-23
-min/epoch, corr_medium's 10,000 samples being ~5x the original dataset).
-Also needed an unrelated environment fix along the way (see above): `nvcc`
-rejecting the conda env's own gcc 14 as host compiler, fixed via
-`CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12`.
+**Environment note**: needed the `CC=gcc-12 CXX=g++-12` fix described at the
+top of this file.
 
-Once finished, Stage 2 (`gpr_diffusion_v6_material.yaml`) needs its
-`vae_checkpoint` path updated to the real `version_N` output directory
-(under `checkpoints/gpr/VAE_stage1_corr_medium/`) before training.
+## Step1 fix attempt 1 (checked 2026-07-11): material conditioning (v6) — did NOT help
+
+`configs/gpr/gpr_diffusion_v6_material.yaml`, using the corr_medium+material
+VAE above. Smoke-tested (5 train/2 val batches) before the full run — clean.
+Trained 50 epochs (`checkpoints/gpr/Diffusion_stage2_v6_material/version_0`,
+~41hr at ~13.75 it/s / 40,260 steps/epoch — corr_medium's 5x larger sample
+count vs. TEUNet is the main driver). Training itself froze silently for
+~11 hours partway through (a background data-loading worker died after a
+transient shared-memory error and the main process hung waiting for a batch
+that would never arrive — a known PyTorch multi-worker deadlock, not
+specific to this project); caught by checking log-file timestamps rather
+than trusting that the process was still alive, killed, and resumed cleanly
+from the last good checkpoint (epoch 14) with no meaningful progress lost.
+
+Evaluated at **epoch 46 of 50** (new `scripts/run_stage2_inference_v6.py`,
+adapted from the TEUNet-era `run_stage2_inference_v5.py`: corr_medium's
+999-sample test set instead of TEUNet's 198, baseline is Step1's own
+prediction instead of TEUNet's, and per-sample Dice-based tiering computed
+on the fly since corr_medium's `test.lst` isn't index-tiered the same fixed
+way TEUNet's was). Full 999-sample eval
+(`scripts/results/stage2_full_test_v6material_epoch46_999samples.txt`):
+
+| Tier | n | v6 IoU vs GT | Step1 IoU vs GT | Diff |
+|---|---|---|---|---|
+| Good | 614 | 0.742 | 0.767 | −0.025 |
+| Moderate | 372 | 0.537 | 0.556 | −0.018 |
+| Poor | 13 | 0.289 | 0.297 | −0.007 |
+| **Overall** | **999** | **0.660** | **0.682** | **−0.023** |
+
+**Negative across every tier, including poor** — actually a meaningfully
+*worse* pattern than any TEUNet-era attempt, where poor tier was always the
+one bright spot (+0.004 to +0.005 there; −0.007 here). This resolved an open
+question: whether the TEUNet-era "model just copies its conditioning
+through" diagnosis (built entirely on TEUNet-conditioned training) would
+transfer to Step1's different, less catastrophic error profile. It does.
+Training was left running toward epoch 50 in the background (converges by
+~epoch 25-30 historically, so this read was expected to hold).
+
+## Visual audit of Step1's own failure modes (2026-07-11)
+
+**This was the first time Step1's actual failures were looked at directly —
+they had been wrongly assumed to look like TEUNet's Pattern A-D (Part 1)
+before this.** New `scripts/visualize_stage2_multi_v6.py`: scans all 999 test
+samples' Step1-vs-GT Dice on the fly to find every "poor" tier case (13
+found), renders all 13 plus 2 good/2 moderate for context (Step1 input / v6
+output / GT), saved to `stage2_v6_visual_comparison_multi.png`.
+
+**Finding 1 (confirms the copy-through diagnosis, now visible directly, not
+just inferred from IoU numbers): in every single row, the v6 model's output
+voxel count and shape track Step1's input almost exactly** — including on
+rows where Step1's shape is completely wrong.
+
+**Finding 2 (Step1's error profile is genuinely different from TEUNet's —
+the reason "stop assuming Pattern A/B/C/D applies here" matters):**
+- **Wrong shape, similar voxel count** (idx=987: Step1 has 9,474 voxels vs.
+  GT's 10,271 — close in size, but Step1's shape is a blocky, disconnected
+  cluster where GT is a set of clean parallel cylinders. Same at idx=986).
+  Step1 found *something* of roughly the right size, just organized wrong —
+  unlike TEUNet's Pattern A, where the conditioning signal often carried
+  zero spatial information at all.
+- **Large undercounts of a bigger true structure** (idx=996: Step1 has
+  16,714 voxels vs. GT's 45,612 — less than half; idx=997: 8,696 vs.
+  12,218). Step1 found a small piece of a much larger junction and stopped.
+- **A few genuinely close cases** (idx=988, idx=990) — topology mostly
+  right, minor branch/length differences.
+
+**No TEUNet-style complete misses (zero-overlap cases) appeared anywhere in
+this sample.** Step1 reliably finds *something* real; the failure mode is
+wrong organization or incompleteness, not "found nothing."
+
+**Implication for what to try next**: since v6 copies Step1's output almost
+exactly even when Step1's shape is plausible-but-wrong (idx=987), a training
+approach that specifically teaches "the hint can be the right size/region
+but structurally wrong" is a better-targeted fix for *this* data's failure
+mode than anything tried on TEUNet data — this is the reasoning behind Step1
+fix attempt 2, below.
+
+## Step1 fix attempt 2 (launched 2026-07-11): corrupted conditioning (v7) — in progress
+
+**Theory**: on most training examples (in both TEUNet's and Step1's data),
+the conditioning hint is already close to GT, so "just copy the hint"
+already scores well on average — the network never had training pressure to
+learn real correction behavior. Classifier-free dropout (Part 1, TEUNet fix
+attempt 3) tested a related but different idea — sometimes removing the
+hint *entirely* — and didn't help; that trains "generate from nothing," not
+"given a wrong hint, fix it." This is the first attempt that makes the hint
+*reliably wrong* (not just occasionally absent) on every training example,
+so copy-through can no longer be a safe default strategy.
+
+**Implementation** — `xcube/data/gpr.py`, new `GPRDataset` constructor
+kwargs `use_corrupted_cond`, `cond_corrupt_drop_prob` (default 0.15),
+`cond_corrupt_add_ratio` (default 0.15), `cond_corrupt_jitter_range`
+(default 2 voxels): a new `_corrupt_cond_grid()` method randomly drops a
+fraction of `COND_PC`'s voxels, then adds jittered-copy noise voxels near
+the kept ones (simulating false-positive/misplaced detections), rebuilding a
+new `fvdb.GridBatch` via `set_from_ijk` (matching the original grid's own
+`voxel_sizes`/`origins`) and a correspondingly resized material tensor.
+**Gated to the training split only** (`self.use_corrupted_cond = use_corrupted_cond
+and split == 'train'`, checked in code, not just by only setting the flag in
+`train_kwargs`) — validation and test always see the real, uncorrupted
+Step1 prediction, so evaluation stays honest and comparable to prior
+attempts. New config `configs/gpr/gpr_diffusion_v7_corrupted.yaml` — same
+architecture, dataset, and material conditioning as v6, adding corrupted
+conditioning as the one new variable.
+
+**Verified directly (not just "didn't crash") before launching**: ran the
+dataset in isolation and confirmed (a) corrupted voxel counts differ
+meaningfully from clean ones (~10% net change per sample, consistent with
+15% drop + 15% jittered-add with some overlap from deduplication), (b)
+material stays perfectly aligned 1:1 with grid voxel count in both the
+clean and corrupted cases, and (c) `use_corrupted_cond` is force-disabled on
+a `val`-split dataset even if passed `True`, confirming the safety gate
+works. Smoke-tested end-to-end (5 train/2 val batches) — clean.
+
+Launched the full 50-epoch run in the user's own terminal (nohup,
+`~/v7_corrupted_training.log`), `checkpoints/gpr/Diffusion_stage2_v7_corrupted/version_0`,
+started 2026-07-11 while v6's own training still had ~1-1.5hrs left on the
+same GPU (VRAM headroom is ample — ~1.4GB/16GB used by v6 alone — so no risk
+of the two runs interfering beyond a modest, temporary compute-sharing
+slowdown to both). Same architecture/dataset size as v6, so **~41hr expected
+for the full 50 epochs**.
+
+## Current status / next steps
+
+As of 2026-07-11: v6 (material conditioning) finished/finishing around
+epoch 50, confirmed negative at epoch 46 (see above). v7 (corrupted
+conditioning) just launched, running toward 50 epochs (~41hr).
+
+**If v7 also lands flat**, remaining real options, in rough priority order:
+1. Check whether the model has hidden correction capacity being averaged
+   away by deterministic single-sample DDIM evaluation, by sampling multiple
+   times per input and inspecting variance.
+2. Try a stronger/differently-shaped corruption (e.g. larger structural
+   swaps rather than voxel-level drop/jitter, closer to idx=987-style
+   whole-region wrong-shape errors specifically) since the visual audit
+   suggests voxel-level noise may not fully capture Step1's actual failure
+   geometry.
+3. If the project's goal allows it, treat the rigorous multi-attempt
+   elimination itself (6 TEUNet attempts + 2 Step1 attempts, 2 different
+   conditioning sources, consistent copy-through diagnosis, confirmed both
+   numerically and visually) as the deliverable rather than a required IoU
+   win — this is a defensible research outcome on its own.
+
+**Not an option going forward**: requesting A-scan/raw-waveform access —
+declined once already, treated as closed.
+
+---
 
 ## Aside: shared-machine disk-space incident (2026-07-08)
 
@@ -649,73 +822,6 @@ non-root account couldn't fully diagnose. Freed ~12G in the meantime via
 safe local cleanup (removed unused `herb-phenology` conda env, stale
 training logs, an unrelated project folder). The other user's data was later
 cleared on their end, restoring ~462G free. Not logged further here since
-it's infra, not modeling -- noted only because it explains why the full
-corr_medium preprocessing run initially failed and had to be redone.
-
-## Stage 1 corr_medium+material retrain finished; Stage 2 v6 launched (2026-07-09)
-
-**Stage 1 result**: `checkpoints/gpr/VAE_stage1_corr_medium/version_1`, 50
-epochs on the full 10,000-sample corr_medium dataset with material
-conditioning. Validation loss 0.85 -> 0.31 (train 1.34 -> 0.27), structure
-accuracy (finest tree level, `struct-acc-0`) 98.8% -> 99.6%, still trending
-down/up slightly at epoch 49 (not fully flattened, unlike the original
-100-epoch Stage 1 run on the smaller dataset). The coarser tree level
-(`struct-acc-1`) sits at a trivial flat 100% throughout. Curve plots:
-`vae_stage1_corr_medium_training.png`. Before/during/after reconstruction
-visual (`scripts/visualize_vae_reconstruction.py`, one GT input sample vs.
-the coarse depth-1 structure vs. the final depth-0 reconstruction) saved to
-`vae_reconstruction_visual.png` -- reconstruction closely matches the input,
-consistent with the measured accuracy.
-
-**Stage 2 v6 (`configs/gpr/gpr_diffusion_v6_material.yaml`)**: updated
-`vae_checkpoint` to point at the real `version_1` checkpoint (was still a
-`version_0` smoke-test placeholder). Smoke-tested (5 train/2 val batches)
-against the new checkpoint -- material embedding + corr_medium dataset load
-cleanly, loss behaves as expected for a fresh diffusion model (~0.997).
-
-Launched the real 50-epoch run in the user's own terminal (nohup,
-`~/v6_material_training.log`), `checkpoints/gpr/Diffusion_stage2_v6_material/version_0`.
-Measured rate ~13.75 it/s, 40,260 steps/epoch -> ~49 min/epoch, so **~41
-hours for 50 epochs** (corr_medium's 10,000 samples vs. the original
-dataset's 1,973 is the main driver, consistent with Stage 1's own ~5x
-slowdown). Given every prior Stage 2 attempt (v1-v5) converged/plateaued by
-epoch ~25-30, plan is to check the in-progress checkpoint at that point
-(~24h in, not the full 50) and decide whether to let it keep running or stop
--- `last.ckpt` updates continuously so stopping early loses nothing.
-
-**Why this run might still land at the same ~0.65-0.66 ceiling as v1-v5**:
-the strongest evidence so far that the model just passes its conditioning
-input through rather than doing real generative correction is the VAE
-round-trip test (zero diffusion, just encode/decode TEUNet's grid, scored
-almost identically to the full trained model) and fix attempt 3 (classifier-free
-dropout -- forcibly removing the conditioning signal during training some of
-the time -- also didn't unlock any real correction behavior). Neither more
-data of a similar statistical character, nor a new conditioning channel
-(material class), changes *what the training loss rewards* -- copying
-through is only an easy shortcut because the condition is usually already
-close to correct, and corr_medium's Step1 predictions are, if anything, even
-closer to correct on average than TEUNet's were (poor-tier share 13.2% ->
-1.3%), so the shortcut may be even more attractive here, not less.
-
-Countering that: the diagnosis above was built entirely from TEUNet-conditioned
-training. If Step1's error profile is qualitatively different (more
-small/local imperfections, less of TEUNet's catastrophic complete-miss
-failure mode) rather than just quantitatively smaller, the model would be
-training on a genuinely different distribution of correction problems than
-the one that produced the "it just copies" diagnosis -- so it's a real open
-question, not a settled one, until the checkpoint eval actually runs.
-
-**If this also lands flat, remaining untried directions** (in rough order of
-promise): (1) request actual A-scan (raw waveform, pre-any-model) access
-again -- corr_medium was requested as this but the data owner declined to
-provide the true raw signal and gave Step1's processed predictions instead,
-so the original hypothesis behind the whole data request is still untested;
-(2) train against a *corrupted* conditioning signal (not just occasionally
-absent, as classifier-free dropout already tried) so blind copy-through
-reliably produces high loss, forcing the network away from the shortcut;
-(3) check whether the model has hidden correction capacity being averaged
-away by deterministic single-sample DDIM evaluation, by sampling multiple
-times per input and inspecting variance; (4) reframe the deliverable around
-the diagnosis itself (a rigorous elimination of architecture/training-regime/
-data-scale causes, isolating the bottleneck as informational) rather than a
-successful IoU improvement, if that fits the project's actual goal.
+it's infra, not modeling — noted only because it explains why the full
+corr_medium preprocessing run initially failed and had to be redone, and
+coincides with the `nvcc`/gcc-14 build issue noted in Environment Setup.

@@ -7,6 +7,7 @@
 # license agreement from NVIDIA CORPORATION & AFFILIATES is strictly prohibited.
 
 import os
+import numpy as np
 import torch
 from loguru import logger
 
@@ -38,7 +39,10 @@ class GPRDataset(RandomSafeDataset):
     def __init__(self, base_path, split, resolution, spec=None,
                  random_seed=0, hparams=None, skip_on_error=False,
                  custom_name="gpr", duplicate_num=1, input_key="input_grid",
-                 hardness_scale=0.0, **kwargs):
+                 hardness_scale=0.0,
+                 use_corrupted_cond=False, cond_corrupt_drop_prob=0.15,
+                 cond_corrupt_add_ratio=0.15, cond_corrupt_jitter_range=2,
+                 **kwargs):
         if isinstance(random_seed, str):
             super().__init__(0, True, skip_on_error)
         else:
@@ -61,6 +65,22 @@ class GPRDataset(RandomSafeDataset):
         # little incentive to learn real correction behavior.
         self.hardness_scale = hardness_scale
 
+        # Corrupted-conditioning (see PROGRESS.md): v1-v6 all left the conditioning
+        # hint (COND_PC) untouched during training, and on most training examples
+        # it's already close to GT -- so "just copy the hint" already scores well
+        # on average, and the network never had a training-time reason to learn
+        # real correction behavior (confirmed by classifier-free dropout in fix
+        # attempt 3 NOT helping, and by material conditioning in fix attempt 7
+        # also not helping). This deliberately damages COND_PC's voxels (random
+        # drop + jittered-copy noise) on EVERY training example -- but never on
+        # val/test, gated by self.split below, so evaluation always reflects the
+        # real, uncorrupted Step1/TEUNet prediction -- so blind copy-through can
+        # no longer be a safe default strategy during training.
+        self.use_corrupted_cond = use_corrupted_cond and split == 'train'
+        self.cond_corrupt_drop_prob = cond_corrupt_drop_prob
+        self.cond_corrupt_add_ratio = cond_corrupt_add_ratio
+        self.cond_corrupt_jitter_range = cond_corrupt_jitter_range
+
         split_file = os.path.join(base_path, (split + '.lst'))
         with open(split_file, 'r') as f:
             stems = f.read().split('\n')
@@ -80,6 +100,47 @@ class GPRDataset(RandomSafeDataset):
 
     def get_short_name(self):
         return self.custom_name
+
+    def _corrupt_cond_grid(self, grid, material, rng):
+        """Randomly drops some of grid's occupied voxels and adds jittered-copy
+        noise voxels nearby (simulating false positives/misplaced detections),
+        so the conditioning hint is reliably wrong on every training example
+        rather than only on the naturally-occurring hard tier."""
+        ijk = grid.ijk[0].jdata.cpu().numpy()
+        mat = material.cpu().numpy()
+        n = ijk.shape[0]
+        if n == 0:
+            return grid, material
+
+        keep_mask = rng.rand(n) >= self.cond_corrupt_drop_prob
+        kept_ijk, kept_mat = ijk[keep_mask], mat[keep_mask]
+
+        n_add = int(len(kept_ijk) * self.cond_corrupt_add_ratio)
+        if n_add > 0 and len(kept_ijk) > 0:
+            src_idx = rng.randint(0, len(kept_ijk), size=n_add)
+            jitter = rng.randint(-self.cond_corrupt_jitter_range,
+                                  self.cond_corrupt_jitter_range + 1, size=(n_add, 3))
+            all_ijk = np.concatenate([kept_ijk, kept_ijk[src_idx] + jitter], axis=0)
+            all_mat = np.concatenate([kept_mat, kept_mat[src_idx]], axis=0)
+        else:
+            all_ijk, all_mat = kept_ijk, kept_mat
+
+        all_ijk, unique_idx = np.unique(all_ijk, axis=0, return_index=True)
+        all_mat = all_mat[unique_idx]
+
+        if all_ijk.shape[0] == 0:
+            # Degenerate case (shouldn't happen with sane drop/add settings) --
+            # fall back to the uncorrupted grid rather than crash on an empty one.
+            return grid, material
+
+        new_grid = fvdb.GridBatch()
+        new_grid.set_from_ijk(
+            fvdb.JaggedTensor(torch.from_numpy(all_ijk.astype(np.int32))),
+            voxel_sizes=grid.voxel_sizes,
+            origins=grid.origins,
+        )
+        new_material = torch.from_numpy(all_mat)
+        return new_grid, new_material
 
     def _get_item(self, data_id, rng):
         item_path = self.all_items[data_id % len(self.all_items)]
@@ -111,14 +172,19 @@ class GPRDataset(RandomSafeDataset):
         # TEUNet's flawed grid as a separate conditioning hint -- always from
         # 'input_grid' regardless of self.input_key, since that's specifically
         # TEUNet's reconstruction in the saved .pkl.
+        cond_grid = input_data['input_grid']
+        cond_material = input_data['input_material']
+        if self.use_corrupted_cond:
+            cond_grid, cond_material = self._corrupt_cond_grid(cond_grid, cond_material, rng)
+
         if DS.COND_PC in self.spec:
-            data[DS.COND_PC] = input_data['input_grid']
+            data[DS.COND_PC] = cond_grid
 
         # Material aligned with COND_PC specifically (always the prediction's
         # material, regardless of input_key) -- needed since Stage 2 encodes
         # COND_PC through the frozen VAE separately from INPUT_PC.
         if DS.COND_MATERIAL in self.spec:
-            data[DS.COND_MATERIAL] = input_data['input_material']
+            data[DS.COND_MATERIAL] = cond_material
 
         if self.hardness_scale > 0:
             teunet_ijk = set(map(tuple, input_data['input_grid'].ijk[0].jdata.cpu().numpy().tolist()))
