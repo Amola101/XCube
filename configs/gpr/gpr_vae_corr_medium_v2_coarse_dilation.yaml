@@ -1,0 +1,28 @@
+include_configs:
+  - gpr_vae_corr_medium.yaml
+
+name: 'gpr/VAE_stage1_corr_medium_v2_coarse_dilation'
+
+# --- Structural confinement fix (PROGRESS.md, 2026-07-14) ---
+# The frozen VAE decoder can only keep-or-prune cells already present in the
+# coarsest candidate grid it's handed, never invent new ones outside it
+# (proven: 0 escaped voxels across 999 corr_medium round-trip test samples).
+# Training always hands it an exactly-correct coarse footprint (this VAE
+# self-reconstructs GT), so it never practices pruning a wider, uncertain
+# candidate region -- exactly what real inference confronts it with, since
+# there the coarse footprint comes from encoding Step1's own possibly-
+# incomplete prediction instead. Measured cost: up to 48% of poor-tier GT
+# structure architecturally unreachable given Step1's coarse footprint.
+#
+# Fix: dilate the coarsest decode-level candidate grid during training itself
+# (kernel_size=3 -> 1-cell margin at the coarse level, same conv_grid
+# mechanism as the TEUNet-era test-time dilation experiments, but this time
+# applied inside Stage 1's own training loop so struct_conv actually learns
+# to prune the added false margin while keeping/filling true cells, rather
+# than a frozen decoder that never practiced with anything but an
+# exactly-correct footprint). See xcube/modules/autoencoding/sunet.py
+# StructPredictionNet.decode().
+network:
+  unet:
+    params:
+      coarse_dilation_kernel: 3

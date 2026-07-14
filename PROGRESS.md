@@ -787,26 +787,131 @@ of the two runs interfering beyond a modest, temporary compute-sharing
 slowdown to both). Same architecture/dataset size as v6, so **~41hr expected
 for the full 50 epochs**.
 
+## VAE round-trip check on corr_medium (2026-07-13): confirms the diffusion training loop is not the bottleneck
+
+**Context**: back in the TEUNet era (Part 1), a diagnostic found that skipping
+the entire diffusion process — running TEUNet's flawed grid through the
+frozen Stage 1 VAE's encoder+decoder directly, zero noise, zero denoising —
+scored almost identically to the full trained diffusion model. That was the
+strongest evidence the diffusion model wasn't doing real corrective work.
+This check had never been re-run on corr_medium/Step1 data; v6/v7's design
+assumed it carried over without verifying it.
+
+New script `scripts/test_vae_roundtrip_corr_medium.py` (adapted from the
+TEUNet-era `test_vae_roundtrip.py`, pointed at the corr_medium VAE checkpoint,
+including material conditioning the same way v6/v7 do). Full 999-sample
+corr_medium test set, on-the-fly Dice-based tiering:
+
+| Tier | n | VAE round-trip only (no diffusion) | Step1 baseline | Diff |
+|---|---|---|---|---|
+| Good | 614 | 0.744 | 0.767 | −0.023 |
+| Moderate | 372 | 0.544 | 0.556 | −0.011 |
+| Poor | 13 | 0.293 | 0.297 | −0.004 |
+| **Overall** | **999** | **0.664** | **0.682** | **−0.019** |
+
+Compare directly to v6's full trained diffusion model (already logged above):
+
+| Tier | v6 full model | VAE round-trip only | Gap |
+|---|---|---|---|
+| Good | 0.742 | 0.744 | +0.002 |
+| Moderate | 0.537 | 0.544 | +0.007 |
+| Poor | 0.289 | 0.293 | +0.004 |
+| **Overall** | **0.660** | **0.664** | **+0.004** |
+
+**Confirmed: the same signature found on TEUNet data reproduces on
+corr_medium/Step1 data.** Skipping the diffusion model entirely gives results
+statistically indistinguishable from (marginally better than) the full
+trained v6 model. **The diffusion training loop is not the bottleneck — the
+ceiling is set by the frozen Stage 1 VAE's encode/decode capacity.** This
+retroactively explains why all 8 Stage-2-training-side fix attempts (6
+TEUNet-era + material conditioning + corrupted conditioning) landed in the
+same narrow band: none of them could have worked, because none touched the
+actual bottleneck.
+
+## Structural confinement diagnostic on corr_medium (2026-07-14): confirmed as a real, tier-dependent ceiling
+
+Directly tests the "structural confinement" theory (Part 1) at the Stage 1
+VAE level, independent of Stage 2/diffusion entirely. The theory: the VAE
+decoder (`sunet.py`'s `decode()`) starts from the coarsest level's structure —
+exactly `latent.grid`, the grid produced by encoding whatever input it's
+given — and can only ever *keep or prune* cells already present in that
+coarse grid; sparse convs can't activate a coarse cell that wasn't already
+there. So any part of GT's true structure whose coarse (2x) parent cell is
+entirely absent from Step1's own coarse footprint is architecturally
+impossible for the decoder to recover, no matter how it was trained.
+
+New script `scripts/test_vae_structural_confinement.py`, using fvdb's
+`GridBatch.coarsened_grid()` (the same helper `base_loss.py` uses to compute
+per-level structure accuracy, so this matches the network's own notion of
+"coarse level" exactly) to measure, per test sample: how much of GT's coarse
+structure is even reachable at all (i.e. overlaps `latent.grid`, Step1's own
+coarse footprint), how much of that reachable part the decoder actually
+recovers, and — as a hard correctness check of the theory itself — whether
+the decoder ever produces structure outside the reachable region at all.
+
+**Sanity check (proof, not measurement): 0 escaped voxels across all 999
+samples.** The decoder never once produced structure outside its
+architecturally reachable region — confinement is an exact, absolute
+property of this architecture, not a tendency.
+
+**Cost of confinement, by tier** (full 999-sample test set,
+`scripts/results/structural_confinement_999samples.txt`):
+
+| Tier | n | % of GT structure architecturally unreachable | Recovery rate within reachable room |
+|---|---|---|---|
+| Good | 614 | 1.9% | 95.9% |
+| Moderate | 372 | 13.2% | 94.0% |
+| Poor | 13 | **48.2%** | 91.5% |
+
+**On poor-tier samples, nearly half of GT's true structure sits in a coarse
+region Step1's own prediction never hinted at — the decoder has zero chance
+of recovering it regardless of training, because it's architecturally boxed
+out of that space before Stage 2 even runs.** Moderate tier shows a smaller
+but still real 13% ceiling. This directly explains why all 8 Stage-2
+training-side fixes landed flat: they were tuning a stage that was never the
+bottleneck.
+
+**Important nuance**: recovery-within-reachable-room is already high (92-96%)
+across every tier — the decoder isn't wasting the room it does have. This
+means simply widening the input footprint at test time (TEUNet fix attempts
+1-2, Part 1 — both failed) isn't sufficient by itself, because the decoder
+was never *trained* to trust an uncertain wider region; it has no learned
+behavior for productively using room it never practiced with. **The real fix
+has to change how Stage 1 is trained** — teaching the VAE's own coarse-level
+structure prediction to productively use a wider, less literal candidate
+region — not a Stage 2 change and not just a test-time dilation.
+
 ## Current status / next steps
 
-As of 2026-07-11: v6 (material conditioning) finished/finishing around
-epoch 50, confirmed negative at epoch 46 (see above). v7 (corrupted
-conditioning) just launched, running toward 50 epochs (~41hr).
+As of 2026-07-14: v6 (material conditioning) finished, confirmed negative
+(epoch 46 read above, ~final). v7 (corrupted conditioning) at epoch 40/50,
+still running (stalled once more around epoch 12 on 2026-07-12 from the same
+known multi-worker deadlock as before, auto-resumed with no progress lost) —
+expected, per the VAE round-trip finding above, to also land in the same
+~0.66 band, since it only ever touched Stage 2. The structural confinement
+finding above is the priority now: it points at a concrete, quantified
+Stage-1-side ceiling (up to 48% of poor-tier GT structure architecturally
+unreachable) rather than an open-ended "try another Stage 2 tweak."
 
-**If v7 also lands flat**, remaining real options, in rough priority order:
-1. Check whether the model has hidden correction capacity being averaged
-   away by deterministic single-sample DDIM evaluation, by sampling multiple
-   times per input and inspecting variance.
-2. Try a stronger/differently-shaped corruption (e.g. larger structural
-   swaps rather than voxel-level drop/jitter, closer to idx=987-style
-   whole-region wrong-shape errors specifically) since the visual audit
-   suggests voxel-level noise may not fully capture Step1's actual failure
-   geometry.
+**Superseded by the two findings above (2026-07-13/14)**: continuing to tweak
+*how Stage 2 trains* is no longer the priority — 8/8 Stage-2-side attempts
+negative, the VAE round-trip confirms the ceiling is set before Stage 2 even
+runs, and the confinement diagnostic quantifies exactly why (up to 48% of
+poor-tier GT structure architecturally unreachable). Redirected priority,
+current order:
+1. **Stage 1 fix** (in progress) — change how the VAE's coarse-level
+   structure prediction is trained so it learns to productively use a wider,
+   less literal candidate region instead of hewing tightly to whatever
+   footprint it's hooked, since test-time-only widening already failed
+   (TEUNet fix attempts 1-2, Part 1) precisely because the decoder never
+   practiced with a wider room.
+2. Let v7 finish for completeness/documentation, but treat it as very likely
+   to also land ~flat, per the round-trip finding.
 3. If the project's goal allows it, treat the rigorous multi-attempt
-   elimination itself (6 TEUNet attempts + 2 Step1 attempts, 2 different
-   conditioning sources, consistent copy-through diagnosis, confirmed both
-   numerically and visually) as the deliverable rather than a required IoU
-   win — this is a defensible research outcome on its own.
+   elimination itself (6 TEUNet + 2 Step1 Stage-2 attempts, 2 different
+   conditioning sources, a confirmed frozen-VAE ceiling, and a quantified
+   confinement mechanism) as a defensible research outcome on its own, even
+   absent a Stage 1 fix that closes the gap.
 
 **Not an option going forward**: requesting A-scan/raw-waveform access —
 declined once already, treated as closed.

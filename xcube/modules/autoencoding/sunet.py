@@ -229,13 +229,26 @@ class AttentionBlock(nn.Module):
 
 class StructPredictionNet(nn.Module):
     def __init__(self, in_channels, num_blocks, f_maps=64, order='gcr', num_groups=8,
-                 pooling='max', pooling_level=[], neck_dense_type="UNCHANGED", cut_ratio=1, neck_bound=4, 
+                 pooling='max', pooling_level=[], neck_dense_type="UNCHANGED", cut_ratio=1, neck_bound=4,
                  with_color_branch=False, with_normal_branch=False,
                  with_semantic_branch=False, num_semantic_classes=23,
                  use_attention=False, use_residual=True, num_res_blocks=1, is_add_dec=True,
-                 unstable_cutoff=False, unstable_cutoff_threshold=0.5, 
-                 use_checkpoint=False, **kwargs):
+                 unstable_cutoff=False, unstable_cutoff_threshold=0.5,
+                 use_checkpoint=False, coarse_dilation_kernel=1, **kwargs):
         super().__init__()
+        # Structural-confinement fix (PROGRESS.md, 2026-07-14): the coarsest
+        # decode level can only keep-or-prune cells already present in the
+        # latent's own grid, never invent new ones (proven: 0 escaped voxels
+        # across 999 corr_medium test samples). Training always hands it an
+        # exactly-correct coarse footprint (self-reconstruction of GT), so it
+        # never practices pruning a wider, uncertain candidate region -- the
+        # exact situation it faces at real inference, conditioned on Step1's
+        # possibly-incomplete footprint. Dilating the coarsest candidate grid
+        # by this kernel size (odd, >=3 to have any effect) before decode()
+        # forces it to learn that judgment; cross_entropy already handles a
+        # prediction grid wider than gt_tree correctly (extra cells labeled
+        # non-exist), so no loss-side change is needed.
+        self.coarse_dilation_kernel = coarse_dilation_kernel
         n_features = [in_channels] + [f_maps * 2 ** k for k in range(num_blocks)]
         logger.info("latent dim: {}".format(int(n_features[-1] / cut_ratio)))
         self.encoders = nn.ModuleList()
@@ -465,9 +478,13 @@ class StructPredictionNet(nn.Module):
         return self._encode(x, hash_tree, True, neck_bound)
     
     def decode(self, res: FeaturesSet, x: fvnn.VDBTensor, is_testing=False):
+        if self.coarse_dilation_kernel > 1:
+            dilated_grid = x.grid.conv_grid(self.coarse_dilation_kernel, 1)
+            x = fvnn.VDBTensor(dilated_grid, dilated_grid.fill_to_grid(x.feature, x.grid, 0.0))
+
         for module in self.post_kl_bottleneck:
             x, _ = module(x)
-        
+
         struct_decision = None
         feat_depth = self.num_blocks - 1
         for block, upsampler, struct_conv in zip(
