@@ -1037,94 +1037,302 @@ Decided **no** to both, for this retrain specifically:
   the frozen Stage-1 encoder, which has no honest way to train on it) —
   not attempted yet, do not conflate with the dilation retrain below.
 
-## Kernel=7 result (`version_1`, evaluated 2026-07-16): ceiling improved as predicted, but final IoU collapsed — root-caused to a class-imbalance bug, fixed
+## Kernel=7 result (`version_1`), a checkpoint-path bug found while investigating it, corrected numbers, and the balance_struct_loss fix's real (negative) result (evaluated 2026-07-16/17)
 
-`version_1` finished all 50 epochs cleanly. Evaluated with
-`scripts/test_vae_roundtrip_corr_medium_v2.py` and
-`scripts/test_vae_structural_confinement_v2.py`:
+`version_1` finished all 50 epochs cleanly. **First evaluation numbers logged
+here were wrong**, due to a bug in the diagnostic scripts themselves —
+corrected below.
 
-| Metric | kernel=1 (original) | kernel=7 (`version_1`) |
-|---|---|---|
-| Round-trip IoU, overall | 0.664 | **0.107** |
-| Round-trip IoU, poor tier | 0.293 | **0.086** |
-| Poor-tier unreachable % (ceiling) | 48.2% | **26.7%** |
-| Recovery within reachable room | 91.5% | 84.2%-88.9% |
+**The bug**: `test_vae_roundtrip_corr_medium_v2.py` and
+`test_vae_structural_confinement_v2.py` had their checkpoint directory
+hardcoded to `version_0/checkpoints` when originally written, and this was
+never updated after `version_1` (or later `version_2`) was trained. So every
+prior run of these two scripts against "kernel=7" was actually loading
+**`version_0`'s weights (trained under the old no-op `conv_grid` bug, i.e.
+never practiced any real dilation at all) combined with kernel=7 hparams
+applied only at inference time** — the exact same failure mode as the
+TEUNet-era test-time-only dilation experiment (Part 1, fix attempt 1), not a
+real test of a checkpoint actually trained with real dilation. Confirmed
+directly: on one sample, `version_0`'s weights under kernel=7 runtime hparams
+produce a massive **over-fill** (115,144 voxels vs. GT's 16,105, coarsest
+level keeps 100% of the 21,518-cell dilated candidate pool — the same
+rubber-stamp behavior as always, just applied to a 4x bigger pool), a
+completely different failure shape from what was reported (which described
+under-filling). Both scripts fixed to take the version directory as an
+argv parameter (`python scripts/test_vae_roundtrip_corr_medium_v2.py version_1`,
+`version_2`, etc.) instead of a hardcoded path, defaulting to `version_2`.
 
-**Two separate effects, opposite directions.** The ceiling genuinely improved
-and closely matched the distance-analysis prediction (poor tier: predicted
-~31.2% unreachable at margin=3, measured 26.7% — see table above; good/
-moderate tiers similarly tracked prediction). But round-trip IoU collapsed
-across every tier. Root cause (checked directly on one sample): the coarsest
-level's candidate pool grew from 5,326 to 21,518 cells (dilation adds ~4x more
-mostly-empty candidates), and the plain unweighted cross-entropy loss at that
-level had no way to account for the new class imbalance — the network learned
-an overly conservative "discard by default" policy, ending up keeping only
-3,248 cells, *fewer* than the 5,326 the undilated model used to correctly keep
-outright. It overcorrected from "always keep" (the old rubber-stamp behavior)
-to "mostly discard," rather than learning real judgment.
+**Corrected numbers, re-run directly against each real checkpoint by path:**
 
-**A bug was found and fixed in the confinement test script itself while
-investigating this**: `test_vae_structural_confinement_v2.py` was still
-computing "reachable" using the old broken `conv_grid` call (a leftover from
-before that bug was found and fixed in `sunet.py` itself) — so its
-"unreachable %" numbers were stale for any dilated checkpoint, and its "0
-escaped voxels" sanity check was showing 99,612 escaped voxels (a false
-alarm from comparing against the wrong, non-dilated boundary, not a real
-confinement violation). Fixed to use the same `set_from_ijk` dilation as
-`sunet.py`'s `decode()`; sanity check passes again (0 escaped) once corrected.
-**Numbers in the table above are from the corrected script.**
+| Metric | kernel=1 (original) | kernel=7, no balance (`version_1`, corrected) | kernel=7 + balance (`version_2`, corrected) |
+|---|---|---|---|
+| Round-trip IoU, overall | 0.664 | 0.131 | 0.117 |
+| Round-trip IoU, poor tier | 0.293 | 0.087 | 0.077 |
+| Poor-tier unreachable % (ceiling) | 48.2% | 26.7% | 26.7% |
+| Recovery within reachable room, overall | ~93-96% | **30.8%** | **27.1%** |
 
-**Fix for the collapse**: added `balance_struct_loss` (`xcube/modules/
-autoencoding/losses/base_loss.py`'s `cross_entropy()`) — per-batch
-inverse-frequency class weighting on the structure-prediction loss, gated by
-a new hparam so existing configs are unaffected. Has negligible effect where
-classes are already roughly balanced (finer, non-dilated levels) and corrects
-specifically where dilation skews the ratio (the coarsest level). Enabled in
-`configs/gpr/gpr_vae_corr_medium_v2_coarse_dilation.yaml`
-(`supervision.balance_struct_loss: true`), kernel size left at 7 (its ceiling
-improvement was real; the loss imbalance, not the margin size, was the
-diagnosed cause of the collapse). Smoke-tested (5 train/2 val batches) —
-clean.
+(The single-sample ad-hoc check from the previous session — 3,248 kept out of
+21,518 candidates for `version_1` — was done by explicit hardcoded path, not
+through the buggy script, so it was correct all along and is consistent with
+these corrected aggregate numbers.)
+
+**The `balance_struct_loss` fix made no meaningful difference — if anything,
+very slightly worse** (recovery-within-reach 30.8% → 27.1%, round-trip IoU
+0.131 → 0.117, both within noise of each other but showing no sign of
+recovery). The class-imbalance theory (dilation floods the coarsest level
+with ~4x more empty candidates, plain cross-entropy has no way to account for
+it) was a reasonable, well-motivated hypothesis, and the mechanism itself
+(inverse-frequency weighting, verified to actually engage via the config —
+`balance_struct_loss: true` resolves correctly through `DictConfig.get()`,
+this was checked directly to rule out yet another silent-flag failure) works
+as designed. **It just isn't the fix for this collapse.** The real cause is
+still unresolved, but two real, correctly-measured training attempts now
+agree: giving this network's coarse-level decision a ~4x wider, mostly-empty
+candidate pool during training collapses its judgment (recovery-within-reach
+~93-96% → ~27-31%) regardless of whether the resulting class imbalance in the
+loss is corrected.
+
+## Clarified: confidence-conditioning does NOT substitute for padding on the confinement question (2026-07-17)
+
+Important correction to the previous entry's framing, raised directly by the
+user: confinement is an exact architectural property (0 escaped voxels, always)
+— the decoder can only keep-or-discard cells already in its candidate pool, and
+**no amount of extra per-voxel signal (confidence or otherwise) lets it produce
+structure in a region that was never offered as a candidate at all.**
+Confidence-conditioning targets a different problem (judging what's
+trustworthy among reachable cells); it is not a substitute fix for the
+confinement ceiling specifically. If closing that ceiling is the goal, some
+form of candidate-pool widening is architecturally required — full stop.
+
+**What the two failed attempts actually ruled out is narrower than "widening
+doesn't work"**: both used `kernel_size=7` (margin=3, ~4x candidate growth in
+one jump), and both collapsed the network's judgment. **A small, genuinely-
+real widening has never actually been tested** — the original `kernel_size=3`
+run (`version_0`) was the no-op `conv_grid` bug, not real dilation at all.
+
+**Decision: test real `kernel_size=3` next** (margin=1, ~1.5-2x candidate
+growth, much gentler than kernel=7's ~4x) — on the theory that the judgment
+collapse was driven by the size of the jump, not by widening per se. Smaller
+predicted ceiling gain (~10% of poor tier's missing structure recoverable,
+vs. kernel=7's ~35%), but a real, previously-untested data point.
+`balance_struct_loss` deliberately left **off** for this run, to isolate
+margin size as the only new variable (kernel=7 already showed balancing
+doesn't clearly help either way, so conflating it here would muddy the
+result). Config (`configs/gpr/gpr_vae_corr_medium_v2_coarse_dilation.yaml`)
+updated, smoke-tested (5 train/2 val batches) — clean.
+
+## Real kernel=3 result (`version_3`, evaluated 2026-07-20): smaller collapse, but still a net regression — structural-dilation path closed for real
+
+`version_3` (real `kernel_size=3`, no loss balancing) finished cleanly.
+Evaluated with the corrected, argv-parameterized scripts:
+
+| Metric | Original (no dilation) | kernel=7 (2 attempts) | kernel=3, real (`version_3`) |
+|---|---|---|---|
+| Round-trip IoU, overall | 0.664 | 0.117-0.131 | **0.300** |
+| Round-trip IoU, poor tier | 0.293 | 0.077-0.087 | **0.166** |
+| Poor-tier unreachable % (ceiling) | 48.2% | 26.7% | 41.4% (close to the ~43% predicted) |
+| Recovery within reachable room, overall | ~93-96% | 27.1-30.8% | **56.6%** |
+
+**Clear dose-response confirmed**: a gentler margin causes a smaller collapse
+(56.6% recovery vs. kernel=7's 27-31%) and a smaller ceiling improvement
+(poor-tier unreachable 48.2%→41.4%, vs. kernel=7's →26.7%) — both exactly as
+the distance analysis and the "size of the jump matters" theory predicted.
+**But even this smallest real margin still nets clearly worse than not
+dilating at all** (overall IoU 0.300 vs. 0.664; poor tier 0.166 vs. 0.293).
+Three real attempts now (kernel=7 alone, kernel=7+balance, kernel=3 alone)
+all land net-negative vs. the undilated baseline.
+
+**Per the decision rule set before this run: this closes the structural-
+dilation path.** The evidence now says the problem is "widening the coarse
+candidate pool during training at all," for this network/training setup, not
+a matter of finding the right margin size or the right loss weighting.
+**The original, undilated VAE (`VAE_stage1_corr_medium/version_1`, 0.664
+overall round-trip IoU) remains the one in active use** — none of the three
+dilation attempts (`version_0`-`version_3` under `VAE_stage1_corr_medium_v2_
+coarse_dilation`) should be used going forward; kept only as a documented
+record of what was tried.
+
+**The confinement ceiling itself (up to 48.2% of poor-tier GT structure
+architecturally unreachable) remains real, quantified, and — for now —
+unresolved.** No fix attempted has closed it without a net-negative
+trade-off. This is an accepted, documented limitation of the current
+approach, not a solved problem — confidence-conditioning (next priority) is
+a genuinely different fix for a different part of the pipeline (judgment on
+already-reachable cells), not a substitute resolution for this ceiling.
+
+## Footprint-erosion fix (`version_0` under `VAE_stage1_corr_medium_v3_erosion`, trained + evaluated 2026-07-21/22): dramatically smaller collapse, but still net-negative overall — poor tier reaches parity
+
+**Theory** (raised directly by the user, reasoning from the "always-fake
+margin" diagnosis above): all three prior dilation attempts padded a margin
+around the coarsest grid's EXACTLY-correct footprint (Stage 1
+self-reconstructs GT), so every margin cell was fake in every single
+training example — the coarsest `struct_conv` had no incentive to do
+anything but learn "always discard the margin," which is useless at real
+inference where Step1's own footprint sometimes correctly omits structure
+and sometimes doesn't. Fix: **erode** a fraction of the coarsest grid's own
+boundary voxels (train-time only) *before* `coarse_dilation_kernel` re-pads
+a margin around what's left, so that margin now contains a genuine mix of
+erased-but-real cells (should be added back) and genuinely-outside cells
+(should stay discarded) — a real judgment call instead of a rigged one.
+
+**Implementation** — `xcube/modules/autoencoding/sunet.py`, new
+`StructPredictionNet` hparam `coarse_erosion_prob` and method
+`_erode_coarse_grid()`: for each batch sample independently (via the grid's
+own `jidx`, so samples never leak into each other's neighbor checks),
+identifies "boundary" coarse voxels (at least one empty face-neighbor) and
+randomly drops a fraction of them, using `JaggedTensor.r_masked_select` +
+`GridBatch.fill_to_grid` (the same safe feature-reprojection idiom the
+existing dilation code already uses) rather than manual reindexing. Called
+at the top of `decode()`, gated on `self.training` (so eval/inference,
+which always calls `.eval()` first, is completely unaffected — verified by
+checking `net.training` directly after `.eval()`). New config
+`configs/gpr/gpr_vae_corr_medium_v3_erosion.yaml`: `coarse_dilation_kernel:
+3` (same margin as the already-measured `version_3` real-kernel=3 run, to
+isolate erosion as the one new variable) + `coarse_erosion_prob: 0.3`.
+
+**Verified directly before training** (learning from the earlier `conv_grid`
+no-op bug — never trust a mechanism just because training doesn't crash): on
+a synthetic two-sample batch, erosion shrank each sample's grid
+independently (216→146 and 64→37 voxels, confirming no cross-sample
+leakage), was an exact no-op at `coarse_erosion_prob=0` (so it cannot affect
+any other existing config), and 100% of eroded voxels were recoverable
+again within the re-dilated margin. `.eval()` correctly set
+`net.training=False`. Smoke-tested end-to-end (5 train/2 val batches) —
+clean, loss decreasing normally.
+
+Trained the full 50 epochs (`checkpoints/gpr/VAE_stage1_corr_medium_v3_erosion/
+version_0`, training loss 30.5 → 0.563). Evaluated with new
+argv-parameterized scripts mirroring the `_v2` ones exactly
+(`scripts/test_vae_roundtrip_corr_medium_v3.py`,
+`scripts/test_vae_structural_confinement_v3.py`), full 999-sample test set:
+
+| Metric | Original (no dilation) | kernel=3 alone (`version_3`) | kernel=3 + erosion (this run) |
+|---|---|---|---|
+| Round-trip IoU, overall | 0.664 | 0.300 | **0.587** |
+| Round-trip IoU, poor tier | 0.293 | 0.166 | **0.285** |
+| Poor-tier unreachable % (ceiling) | 48.2% | 41.4% | 41.4% (unchanged, as expected — erosion doesn't change what dilation can reach, only how well the network judges it) |
+| Recovery within reachable room, overall | ~93-96% | 56.6% | **85.5%** |
+
+**Two real findings here, not one:**
+
+1. **The always-fake-margin mechanism was real and was a major driver of the
+   collapse, not the whole story.** Recovery-within-reach jumped from 56.6%
+   (kernel=3 alone) to 85.5% (kernel=3 + erosion) — most of the way back to
+   the undilated baseline's ~93-96%, and overall round-trip IoU recovered
+   from 0.300 to 0.587 (closing roughly 79% of the gap to 0.664). This is a
+   categorically different result from every prior dilation attempt, all of
+   which landed in a narrow 0.117-0.300 band regardless of margin size or
+   loss balancing.
+2. **Poor tier — the tier the whole confinement ceiling was originally
+   measured on — is now within noise of the undilated baseline** (0.285 vs.
+   0.293, a −0.008 difference, essentially flat) while simultaneously having
+   a wider theoretically-reachable region than baseline (41.4% vs. 48.2%
+   unreachable). That combination (same practical accuracy, larger reachable
+   ceiling) did not happen in any prior dilation attempt.
+3. **Still net-negative overall** (0.587 vs. 0.664, a real −0.077 gap,
+   concentrated in good/moderate tiers) — erosion narrowed the collapse
+   substantially but did not fully close it. `coarse_erosion_prob=0.3` was a
+   reasonable starting guess, not a tuned value, so it's not yet known
+   whether a different erosion strength would close more of the remaining
+   gap or whether 85.5%/56.6%-style recovery is close to this mechanism's
+   ceiling.
+
+**Decision (2026-07-22, user call): stop here rather than tune
+`coarse_erosion_prob` further.** `coarse_erosion_prob=0.3` was a first
+guess, not a tuned value, so a different strength might close more of the
+remaining gap — but the user chose to treat this as the closing result for
+the structural-dilation/erosion family rather than spend another ~20hr
+retrain chasing it. **This closes the dilation/erosion line of fixes.** The
+original, undilated VAE (`VAE_stage1_corr_medium/version_1`, 0.664 overall
+round-trip IoU) remains the one in active use; `version_0` under
+`VAE_stage1_corr_medium_v3_erosion` is kept only as a documented record —
+notably a much stronger record than the plain-dilation attempts, since it
+isolates and confirms the always-fake-margin mechanism as real, even though
+it doesn't change which checkpoint is in active use.
+
+**Net takeaway for this whole family (plain dilation → erosion+dilation)**:
+the coarse-level confinement ceiling (up to 48.2% of poor-tier GT structure
+architecturally unreachable) is real and quantified; widening the candidate
+pool during training can now be shown to fail for a *specific, confirmed*
+reason (always-fake margin, not an unfixable structural property of the
+network) rather than an unexplained collapse — but confirming the mechanism
+did not, on its own, turn out to be sufficient to make widening net-positive
+at the one erosion strength tested. Poor tier reaching parity while gaining
+reachable room is the one genuinely new, positive data point from this
+whole family; it just wasn't enough to carry the overall number past
+baseline.
+
+## Reporting visuals for Stage 2 diffusion (v7), and three real single-sample data points (2026-07-22/23)
+
+Not a new fix attempt — a documentation/reporting pass, built on the request
+to have shareable visuals of the current Stage 2 diffusion model analogous
+to the existing Stage 1 VAE reconstruction diagram
+(`scripts/visualize_vae_reconstruction.py`). All renders are from real
+inference on the trained `Diffusion_stage2_v7_corrupted/version_0` checkpoint
+(corr_medium, material + corrupted conditioning) — no mockups.
+
+New scripts:
+- `scripts/plot_diffusion_v7_training_curve.py`: reads v7's own TensorBoard
+  event files directly (two of them, merged — training paused ~11hrs
+  mid-run after a dataloader worker crash and resumed, see the 2026-07-11
+  entry) and plots train/val loss vs. epoch. **Result: train loss
+  0.474→0.382, val loss 0.440→0.368 over 50 epochs, train and val tracking
+  closely the whole run (no overfitting).**
+- `scripts/visualize_stage2_multi_v7_clean.py`: one representative
+  good/moderate/poor tier sample each (Step1 input / Stage 2 output / GT),
+  real DDIM-100 inference per sample. Iterated once on styling per user
+  feedback: blue voxel fill (matplotlib default, matching the original
+  `visualize_stage2_multi_v6.py` look) with column titles above each panel,
+  not the initial purple/below-panel-caption style first tried.
+- `scripts/visualize_diffusion_pipeline.py`: diffusion analog of
+  `visualize_vae_reconstruction.py` — same test sample (idx 0, 16,105 GT
+  voxels, the same one already used in the existing VAE diagram, chosen for
+  direct visual continuity between the two diagrams). Renders Step1's input
+  (amber, marked visually as "the flawed hint" rather than trusted
+  structure), the encoded conditioning latent (PCA→HSV colored, same
+  technique as the VAE embedding panel), the coarse half-resolution
+  structure the diffusion-guided decode predicts first, the final Stage 2
+  output, and (new relative to the VAE version, since here input != target)
+  ground truth for comparison.
+
+**The one real numeric data point from this pass**: on the good-tier sample
+used in the pipeline diagram, IoU(Step1 input, GT) = 0.717 vs. IoU(Stage 2
+output, GT) = 0.722 — a +0.005 nudge. Consistent with, not contradicting,
+the standing "copies its conditioning through" diagnosis (VAE round-trip
+check, 2026-07-13): a single good-tier sample where the hint was already
+close to correct is exactly where copy-through-with-marginal-adjustment is
+expected to look almost identical to the baseline. **This is one sample, not
+a tier average — v7 still has not been run through the full 999-sample
+evaluation** (still item 2 in the priority list below).
+
+All three visuals assembled into one shareable report:
+https://claude.ai/code/artifact/601876f7-0ac5-40a1-9a2c-92125123ac16
+(private Claude Artifact, not part of the git repo).
 
 ## Current status / next steps
 
-As of 2026-07-16: kernel=7 with `balance_struct_loss: true` is being launched
-in the user's own terminal next (`version_2`, since `version_1` is the
-now-understood collapsed run — kept for reference, not deleted). ~20hr
-expected. v7 (corrupted conditioning, Stage 2) still finished-but-unevaluated.
-
-**Decision rule for when this run finishes** (unchanged in spirit from the
-last round, re-applied here): run the same two diagnostics against
-`version_2`.
-- **If round-trip IoU is at or above the original 0.664 baseline overall**,
-  with poor tier ideally moving toward the ~31% predicted unreachable-%
-  ceiling **and** recovery-within-reach back near the original ~91-96% (i.e.
-  the imbalance fix actually restored good judgment rather than just
-  changing the collapse's severity) → proceed to retrain Stage 2 diffusion
-  on top of this new VAE and run the full 999-sample evaluation.
-- **If it's still flat-or-worse than the 0.664 baseline** → this is now two
-  real attempts at the structural-fix path (no-op dilation, then a
-  genuinely-dilated-but-imbalanced version) plus one targeted repair; treat
-  further tuning here as diminishing returns, and move to properly designing
-  the confidence-conditioning idea (Stage 2 non-frozen layers, per the
-  discussion above) as the next genuinely different hypothesis.
+As of 2026-07-23: the structural-dilation/erosion line of fixes on Stage 1
+is closed by user decision (see above) — the footprint-erosion variant is
+the strongest result in that family (poor tier reached parity with
+baseline) but still net-negative overall, and further tuning was decided
+against. The original, undilated VAE remains the one in active use. v7
+(corrupted conditioning, Stage 2) still finished-but-unevaluated on the full
+test set (only single-sample spot checks exist so far — see above).
 
 Priority order:
-1. **Let the `balance_struct_loss` retrain (`version_2`) finish**, then apply
-   the decision rule above.
-2. Consider whether the false-positive-pruning gap is worth a separate fix
-   (e.g. corrupting Stage 1's training footprint with spurious far-away
-   blocks, mirroring Stage 2's corrupted-conditioning idea) — a real,
-   now-quantified gap (28.6% net false-positive survival into the final
-   output), but lower priority than #1.
-3. Evaluate v7 (corrupted conditioning) on the full 999-sample test set for
-   completeness — expected to land ~flat per the round-trip finding, but not
-   yet measured.
-4. If the project's goal allows it, treat the rigorous multi-attempt
-   elimination itself (6 TEUNet + 2 Step1 Stage-2 attempts, 2 different
-   conditioning sources, a confirmed frozen-VAE ceiling, and two now-quantified
-   confinement mechanisms) as a defensible research outcome on its own, even
-   absent a Stage 1 fix that closes the gap.
+1. **Design confidence-conditioning properly** (Stage 2's non-frozen
+   diffusion layers, per the 2026-07-15 discussion — ground truth has no
+   natural confidence value, so this cannot live in Stage 1's frozen encoder
+   the way material does). Targets judgment on reachable cells (including
+   the 28.6% false-positive-pruning leak, logged 2026-07-15) — a real,
+   different problem, explicitly not a fix for the confinement ceiling.
+2. Evaluate v7 (corrupted conditioning) on the full 999-sample test set for
+   completeness — expected to land ~flat, but not yet measured.
+3. If the project's goal allows it, treat the rigorous multi-attempt
+   elimination itself (6 TEUNet + 2 Step1 Stage-2 attempts + 4 Step1 Stage-1
+   structural attempts, a confirmed frozen-VAE ceiling, and multiple
+   now-quantified confinement/imbalance mechanisms) as a defensible research
+   outcome on its own, even absent a fix that fully closes the gap.
 
 **Not an option going forward**: requesting A-scan/raw-waveform access —
 declined once already, treated as closed.

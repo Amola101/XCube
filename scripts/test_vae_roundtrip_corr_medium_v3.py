@@ -1,17 +1,17 @@
 """
-Same diagnostic as test_vae_roundtrip_corr_medium.py, but pointed at the new
-Stage 1 VAE trained with the coarse-dilation fix (PROGRESS.md, 2026-07-14:
-`coarse_dilation_kernel=3` in xcube/modules/autoencoding/sunet.py's decode(),
-config configs/gpr/gpr_vae_corr_medium_v2_coarse_dilation.yaml).
-
-Purpose: check whether widening the coarse candidate region during Stage 1
-training itself (instead of only at test time, which already failed in the
-TEUNet era) improved round-trip IoU vs. the original corr_medium VAE -- most
-importantly on the poor tier, where the old structural-confinement measurement
-found up to 48% of GT's coarse structure was architecturally unreachable.
+Same diagnostic as test_vae_roundtrip_corr_medium_v2.py, but pointed at the
+Stage 1 VAE trained with the footprint-erosion fix (PROGRESS.md, 2026-07-21:
+`coarse_erosion_prob` in xcube/modules/autoencoding/sunet.py's decode(),
+config configs/gpr/gpr_vae_corr_medium_v3_erosion.yaml). Combines
+coarse_dilation_kernel=3 (same margin size as the v2 script's version_3 real
+kernel=3 run, 0.300 overall round-trip IoU) with train-time erosion of a
+fraction of the coarsest grid's own boundary voxels before re-padding, so
+that margin contains a genuine mix of erased-but-real cells and
+genuinely-outside cells during training, instead of the always-100%-fake
+margin the plain dilation attempts used.
 
 Usage:
-    python scripts/test_vae_roundtrip_corr_medium_v2.py
+    python scripts/test_vae_roundtrip_corr_medium_v3.py [version]
 """
 import sys
 sys.path.insert(0, '/home/ameliacatala/Documents/XCube')
@@ -38,16 +38,9 @@ class CustomUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 custom_pickle.Unpickler = CustomUnpickler
 
-VAE_CONFIG = Path('/home/ameliacatala/Documents/XCube/configs/gpr/gpr_vae_corr_medium_v2_coarse_dilation.yaml')
-# NOTE (2026-07-17): this used to be hardcoded to version_0 and never updated
-# after version_1/version_2 were trained, so every prior run of this script
-# silently evaluated version_0's (no-op-dilation) WEIGHTS combined with
-# whatever coarse_dilation_kernel the current yaml config happened to set at
-# runtime -- an inconsistent, uninformative combination, not a real test of
-# any specific trained checkpoint. Now takes the version dir as argv[1].
-import sys as _sys
-_version = _sys.argv[1] if len(_sys.argv) > 1 else 'version_2'
-VAE_CKPT_DIR = Path(f'/home/ameliacatala/Documents/checkpoints/gpr/VAE_stage1_corr_medium_v2_coarse_dilation/{_version}/checkpoints')
+VAE_CONFIG = Path('/home/ameliacatala/Documents/XCube/configs/gpr/gpr_vae_corr_medium_v3_erosion.yaml')
+_version = sys.argv[1] if len(sys.argv) > 1 else 'version_0'
+VAE_CKPT_DIR = Path(f'/home/ameliacatala/Documents/checkpoints/gpr/VAE_stage1_corr_medium_v3_erosion/{_version}/checkpoints')
 DATA_DIR = Path('/home/ameliacatala/Documents/preprocess/data_full/gpr_corr_medium')
 
 ckpts = sorted(VAE_CKPT_DIR.glob('epoch=*.ckpt'), key=lambda p: p.stat().st_mtime)
@@ -59,6 +52,8 @@ net_module = importlib.import_module("xcube.models." + model_args.model).Model
 vae = net_module.load_from_checkpoint(VAE_CKPT, hparams=model_args)
 vae = vae.cuda().eval()
 print('coarse_dilation_kernel =', getattr(vae.unet, 'coarse_dilation_kernel', 1))
+print('coarse_erosion_prob =', getattr(vae.unet, 'coarse_erosion_prob', 0.0),
+      '(should have NO effect here -- eval() sets self.training=False, so decode() never erodes at test time)')
 
 stems = [s for s in (DATA_DIR / 'test.lst').read_text().split('\n') if s]
 print(f'{len(stems)} test samples.\n')

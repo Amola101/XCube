@@ -39,21 +39,29 @@ name: 'gpr/VAE_stage1_corr_medium_v2_coarse_dilation'
 # territory that collapsed to ~0 IoU in TEUNet fix attempt 4 (Part 1, fully
 # open candidate region) -- kernel=7 was chosen as the more conservative step.
 #
-# NOTE (2026-07-16): kernel=7's first real run (version_1) improved the
-# architectural ceiling roughly as predicted (poor-tier unreachable structure
-# 48.2% -> 26.7%), but round-trip IoU collapsed (0.66 -> 0.11 overall) because
-# the coarsest level's plain (unweighted) cross-entropy loss got flooded with
-# ~4x more mostly-empty candidate cells from the dilation, and learned an
-# overly conservative "when in doubt, discard" policy -- it kept only 3,248 of
-# the widened 21,518-cell candidate pool for one checked sample, fewer than
-# the 5,326 cells the undilated model used to correctly keep outright. Added
-# `balance_struct_loss` (xcube/modules/autoencoding/losses/base_loss.py) to
-# counteract this via per-batch inverse-frequency class weighting -- has
-# little effect where classes are already balanced (finer levels) and
-# corrects specifically where dilation skews the ratio (the coarsest level).
+# NOTE (2026-07-16/17): kernel=7 was tried twice, both with a corrected
+# checkpoint-path bug in the eval scripts (see PROGRESS.md) -- once alone
+# (version_1) and once with `balance_struct_loss` (version_2, per-batch
+# inverse-frequency class weighting on the structure loss, added to counteract
+# the ~4x flood of mostly-empty candidate cells the kernel=7 margin
+# introduces). BOTH collapsed round-trip IoU from the 0.664 baseline to
+# ~0.12-0.13, and "recovery within reachable room" from ~93-96% down to
+# ~27-31% -- the network's judgment broke down given that much extra room,
+# regardless of loss balancing. The ceiling itself did improve as predicted
+# both times (poor-tier unreachable 48.2% -> 26.7%), confirming the mechanism
+# works architecturally, but isn't recoverable by the network as trained.
+#
+# NOTE (2026-07-17): kernel_size dropped back to 3 -- but this time with the
+# corrected set_from_ijk-based real dilation (unlike the original `version_0`,
+# which used the no-op conv_grid bug and never actually widened anything).
+# This is the first genuine test of a SMALL, real widening: only ~1.5-2x more
+# candidates rather than kernel=7's ~4x, on the theory that the judgment
+# collapse was driven by the size of the jump, not by widening per se. Smaller
+# predicted ceiling gain (~10% of poor tier's missing structure recoverable,
+# vs. kernel=7's ~35%), but isolated as a single-variable test:
+# `balance_struct_loss` left OFF here to avoid conflating two variables in one
+# run, since kernel=7 already showed balancing doesn't clearly help either way.
 network:
   unet:
     params:
-      coarse_dilation_kernel: 7
-supervision:
-  balance_struct_loss: true
+      coarse_dilation_kernel: 3

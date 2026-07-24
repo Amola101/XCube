@@ -1,24 +1,16 @@
 """
-Same structural-confinement diagnostic as test_vae_structural_confinement.py,
-but pointed at the new Stage 1 VAE trained with the coarse-dilation fix
-(PROGRESS.md, 2026-07-14: coarse_dilation_kernel=3 in
-xcube/modules/autoencoding/sunet.py's decode()).
+Same structural-confinement diagnostic as test_vae_structural_confinement_v2.py,
+but pointed at the Stage 1 VAE trained with the footprint-erosion fix
+(PROGRESS.md, 2026-07-21: coarse_erosion_prob in xcube/modules/autoencoding/
+sunet.py's decode(), config configs/gpr/gpr_vae_corr_medium_v3_erosion.yaml).
 
-Key difference from the v1 script: for this model, decode() dilates the raw
-encoder output (`latent.grid`) by `coarse_dilation_kernel` via `conv_grid`
-*before* running the coarsest struct_conv (see sunet.py StructPredictionNet.
-decode(), the `if self.coarse_dilation_kernel > 1` branch). That dilated grid,
-not `latent.grid` itself, is the decoder's real architecturally-reachable
-region for this model. Measuring reachability against plain `latent.grid` (as
-v1's script did, correctly, since v1 had no dilation) would make this model
-look like it violates confinement (voxels appearing "outside" `latent.grid`)
-when actually it's using the wider room it was deliberately given. This script
-mirrors decode()'s own dilation step when computing reachability, so the "0
-escaped voxels" sanity check stays a meaningful confinement check rather than
-a false alarm.
+Reachability is still measured against the coarse_dilation_kernel-padded grid
+(erosion only happens train-time, gated on self.training; eval() disables it,
+so at test time decode() sees the real, unmodified Step1 coarse footprint --
+same reachable region definition as the v2 script).
 
 Usage:
-    python scripts/test_vae_structural_confinement_v2.py [n_samples]
+    python scripts/test_vae_structural_confinement_v3.py [version] [n_samples]
 
 n_samples defaults to the full test set (999 for corr_medium).
 """
@@ -48,12 +40,9 @@ class CustomUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 custom_pickle.Unpickler = CustomUnpickler
 
-VAE_CONFIG = Path('/home/ameliacatala/Documents/XCube/configs/gpr/gpr_vae_corr_medium_v2_coarse_dilation.yaml')
-# NOTE (2026-07-17): this used to be hardcoded to version_0 and never updated
-# after version_1/version_2 were trained -- see test_vae_roundtrip_corr_medium_v2.py's
-# matching note. Now takes the version dir as argv[1] (n_samples moved to argv[2]).
-_version = sys.argv[1] if len(sys.argv) > 1 else 'version_2'
-VAE_CKPT_DIR = Path(f'/home/ameliacatala/Documents/checkpoints/gpr/VAE_stage1_corr_medium_v2_coarse_dilation/{_version}/checkpoints')
+VAE_CONFIG = Path('/home/ameliacatala/Documents/XCube/configs/gpr/gpr_vae_corr_medium_v3_erosion.yaml')
+_version = sys.argv[1] if len(sys.argv) > 1 else 'version_0'
+VAE_CKPT_DIR = Path(f'/home/ameliacatala/Documents/checkpoints/gpr/VAE_stage1_corr_medium_v3_erosion/{_version}/checkpoints')
 DATA_DIR = Path('/home/ameliacatala/Documents/preprocess/data_full/gpr_corr_medium')
 
 ckpts = sorted(VAE_CKPT_DIR.glob('epoch=*.ckpt'), key=lambda p: p.stat().st_mtime)
@@ -67,6 +56,8 @@ vae = vae.cuda().eval()
 
 COARSE_DILATION_KERNEL = getattr(vae.unet, 'coarse_dilation_kernel', 1)
 print('coarse_dilation_kernel =', COARSE_DILATION_KERNEL)
+print('coarse_erosion_prob =', getattr(vae.unet, 'coarse_erosion_prob', 0.0),
+      '(should have NO effect here -- eval() sets self.training=False)')
 
 # coarsest decode level for tree_depth=2 / num_blocks=2 is feat_depth=1 -> 2x downsample,
 # matching how base_loss.py computes struct-acc-1 (gt_grid.coarsened_grid(2 ** feat_depth)).
@@ -111,13 +102,6 @@ for i, stem in enumerate(stems):
         latent = vae._encode({DS.INPUT_PC: step1_grid, DS.INPUT_MATERIAL: step1_material}, use_mode=True)
         reach_grid = latent.grid
         if COARSE_DILATION_KERNEL > 1:
-            # NOTE (2026-07-16): this used to call latent.grid.conv_grid(k, 1),
-            # which does NOT grow the active voxel set (see PROGRESS.md,
-            # 2026-07-15 -- verified conv_grid returns an identical footprint
-            # for any kernel size). That made this script's "unreachable %"
-            # silently stale/wrong for any dilated checkpoint, even after
-            # sunet.py's decode() itself was fixed to use set_from_ijk's
-            # pad_min/pad_max. Fixed here to match decode()'s real dilation.
             margin = (COARSE_DILATION_KERNEL - 1) // 2
             reach_grid = fvdb.GridBatch(device=latent.grid.device)
             reach_grid.set_from_ijk(

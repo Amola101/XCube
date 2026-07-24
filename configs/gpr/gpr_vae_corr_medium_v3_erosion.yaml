@@ -1,0 +1,35 @@
+include_configs:
+  - gpr_vae_corr_medium.yaml
+
+name: 'gpr/VAE_stage1_corr_medium_v3_erosion'
+
+# --- Footprint-erosion fix (PROGRESS.md, 2026-07-21) ---
+# Three real coarse-dilation attempts (kernel=7 alone, kernel=7+balance,
+# kernel=3 -- see gpr_vae_corr_medium_v2_coarse_dilation.yaml) all landed
+# net-negative vs. the undilated baseline (kernel=3's smallest real margin:
+# round-trip IoU 0.300 vs. 0.664 baseline). Root theory for why: dilation
+# always pads a margin around the coarsest grid's EXACTLY-correct footprint
+# (Stage 1 self-reconstructs GT), so every margin cell is fake in every
+# single training example -- the coarsest struct_conv converges to "always
+# discard the margin" rather than judging each candidate, which is useless
+# at real inference, where Step1's own coarse footprint sometimes correctly
+# omits structure and sometimes doesn't.
+#
+# This tests a mechanistically different fix: xcube/modules/autoencoding/
+# sunet.py's new coarse_erosion_prob randomly drops a fraction of the
+# coarsest grid's own BOUNDARY voxels (train-time only) BEFORE
+# coarse_dilation_kernel re-pads a margin around what's left. That margin
+# now contains a genuine mix -- some erased-but-real cells (should be added
+# back) and some genuinely-outside cells (should stay discarded) -- a real
+# judgment call instead of a rigged one.
+#
+# Kernel size kept at 3 (the smallest real-dilation margin already tested,
+# via _v2_coarse_dilation's version_3) specifically so this is a direct,
+# single-variable comparison against that already-measured result: isolates
+# erosion as the one new variable on top of the same margin size, rather
+# than conflating margin size and erosion in one run.
+network:
+  unet:
+    params:
+      coarse_dilation_kernel: 3
+      coarse_erosion_prob: 0.3

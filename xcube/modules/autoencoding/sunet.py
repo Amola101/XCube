@@ -234,7 +234,7 @@ class StructPredictionNet(nn.Module):
                  with_semantic_branch=False, num_semantic_classes=23,
                  use_attention=False, use_residual=True, num_res_blocks=1, is_add_dec=True,
                  unstable_cutoff=False, unstable_cutoff_threshold=0.5,
-                 use_checkpoint=False, coarse_dilation_kernel=1, **kwargs):
+                 use_checkpoint=False, coarse_dilation_kernel=1, coarse_erosion_prob=0.0, **kwargs):
         super().__init__()
         # Structural-confinement fix (PROGRESS.md, 2026-07-14): the coarsest
         # decode level can only keep-or-prune cells already present in the
@@ -249,6 +249,23 @@ class StructPredictionNet(nn.Module):
         # prediction grid wider than gt_tree correctly (extra cells labeled
         # non-exist), so no loss-side change is needed.
         self.coarse_dilation_kernel = coarse_dilation_kernel
+        # Footprint-erosion fix (PROGRESS.md, 2026-07-21): three real dilation
+        # attempts (kernel=7 alone, kernel=7+balance, kernel=3) all landed
+        # net-negative. Root theory: dilation always pads a margin around the
+        # coarsest grid's EXACTLY-correct footprint (self-reconstruction of
+        # GT), so 100% of every training margin cell is fake, every time --
+        # the network converges to "always discard the margin" rather than
+        # judging each candidate, which is useless at real inference where
+        # Step1's own coarse footprint is sometimes correctly missing
+        # structure and sometimes not. This randomly drops a fraction of the
+        # coarsest grid's own BOUNDARY cells (see _erode_coarse_grid) BEFORE
+        # coarse_dilation_kernel re-pads a margin around what's left, so that
+        # margin now contains a genuine mix of erased-but-real cells (should
+        # be added back) and genuinely-outside cells (should stay discarded)
+        # -- a real judgment call. Train-time only (gated on self.training);
+        # only has an effect when combined with coarse_dilation_kernel >= 3
+        # (otherwise erased cells have no candidate room to be recovered in).
+        self.coarse_erosion_prob = coarse_erosion_prob
         n_features = [in_channels] + [f_maps * 2 ** k for k in range(num_blocks)]
         logger.info("latent dim: {}".format(int(n_features[-1] / cut_ratio)))
         self.encoders = nn.ModuleList()
@@ -477,7 +494,59 @@ class StructPredictionNet(nn.Module):
     def encode(self, x: fvnn.VDBTensor, hash_tree: dict, neck_bound=None):
         return self._encode(x, hash_tree, True, neck_bound)
     
+    def _erode_coarse_grid(self, x: fvnn.VDBTensor) -> fvnn.VDBTensor:
+        """Randomly drops a fraction of x's own BOUNDARY voxels -- cells with
+        at least one empty face-neighbor, checked within each batch sample
+        independently via the grid's own jidx so samples never leak into each
+        other's neighbor checks. See PROGRESS.md, 2026-07-21."""
+        ijk_jt = x.grid.ijk
+        ijk = ijk_jt.jdata.cpu().numpy()
+        batch_idx = ijk_jt.jidx.cpu().numpy().astype(np.int64)
+        n = ijk.shape[0]
+        if n == 0:
+            return x
+
+        def pack(coords, bidx):
+            # Bit-pack (batch_idx, i, j, k) into one int64 key per voxel so
+            # membership checks below never match voxels across batch items.
+            offset = 1 << 19
+            c = coords.astype(np.int64) + offset
+            return (bidx << 60) | (c[:, 0] << 40) | (c[:, 1] << 20) | c[:, 2]
+
+        keys = pack(ijk, batch_idx)
+        is_boundary = np.zeros(n, dtype=bool)
+        for axis in range(3):
+            for sign in (-1, 1):
+                offset = np.zeros(3, dtype=np.int64)
+                offset[axis] = sign
+                neighbor_keys = pack(ijk + offset, batch_idx)
+                is_boundary |= ~np.isin(neighbor_keys, keys, assume_unique=True)
+
+        drop_mask = is_boundary & (np.random.rand(n) < self.coarse_erosion_prob)
+        if not drop_mask.any():
+            return x
+        keep_mask_np = ~drop_mask
+        if not keep_mask_np.any():
+            # Degenerate (would erode away an entire sample's coarse
+            # structure) -- skip erosion this call rather than hand decode()
+            # an empty grid.
+            return x
+
+        keep_mask = torch.from_numpy(keep_mask_np).to(x.grid.device)
+        eroded_ijk = ijk_jt.r_masked_select(keep_mask)
+
+        eroded_grid = fvdb.GridBatch(device=x.grid.device)
+        eroded_grid.set_from_ijk(
+            eroded_ijk,
+            voxel_sizes=x.grid.voxel_sizes,
+            origins=x.grid.origins,
+        )
+        eroded_feature = eroded_grid.fill_to_grid(x.feature, x.grid, 0.0)
+        return fvnn.VDBTensor(eroded_grid, eroded_feature)
+
     def decode(self, res: FeaturesSet, x: fvnn.VDBTensor, is_testing=False):
+        if self.training and self.coarse_erosion_prob > 0:
+            x = self._erode_coarse_grid(x)
         if self.coarse_dilation_kernel > 1:
             # NOTE (2026-07-15): GridBatch.conv_grid(kernel_size, stride=1) does NOT
             # grow the active voxel set -- it returns the identical footprint as the
