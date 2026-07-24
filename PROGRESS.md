@@ -42,6 +42,13 @@ differently and should not be conflated:**
 - Building fVDB from source needed 4 patches for libtorch-version drift
   (`torch::linalg::inv` removed, a CuBLAS reduction option enum change, a
   duplicate pybind11 type caster, and CUDA include-path environment variables).
+  **The literal diff (not just this description) is saved at
+  `docs/environment/fvdb_build_patches.diff`, version-pinned to the exact
+  PyTorch/CUDA/gcc/pybind11 combination it was captured against (2026-07-24)
+  — a different account on this same machine, hitting the same system-wide
+  CUDA install and GPU, is the most likely case where it still applies
+  as-is; a genuinely different machine should treat it as a reference, not
+  a blind patch.**
 - **Required env var**: `LD_PRELOAD=.../envs/preproc/lib/libstdc++.so.6` (system
   libstdc++ is too old). Originally set via `LD_LIBRARY_PATH` instead, which
   caused a hard-to-diagnose `CUBLAS_STATUS_NOT_INITIALIZED` bug by shadowing

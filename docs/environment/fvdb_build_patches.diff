@@ -1,0 +1,123 @@
+# fVDB build patches — machine-specific, version-pinned reference
+
+These 4 patches were needed to build the real fVDB library (`xcube/`'s
+dependency: `fvdb.nn.VDBTensor`, missing from the publicly installable
+`fvdb_core` package) from source, from a specific historical PR of
+AcademySoftwareFoundation/openvdb (`pull/1808/head`, branch `feature/fvdb`),
+cloned into `openvdb/` (gitignored — a separate third-party library, not
+part of this repo). See PROGRESS.md's "Environment setup" section for the
+full narrative context.
+
+**This patch is captured against one specific toolchain and is NOT
+guaranteed to apply cleanly, or even be the right fix, on a different
+combination of versions.** These are version-drift fixes (a removed torch
+API, a changed CUDA/cuBLAS enum, a duplicate pybind11 type caster) — if any
+of the versions below differ on the machine you're reading this on, treat
+this file as a *reference for the kind of fix needed*, not a blind
+copy-paste. Re-derive from the actual build error first; only reach for
+this diff if your versions match exactly.
+
+Captured 2026-07-24 on this machine, against:
+  - PyTorch:  2.10.0 (built against CUDA 12.9)
+  - CUDA toolkit used for the JIT/build (NOT the default `nvcc`):
+              /usr/local/cuda-12.4, release 12.4.131 — this project pins
+              PATH=/usr/local/cuda-12.4/bin explicitly (see PROGRESS.md);
+              the machine also has a separate default CUDA 12.9 install
+              that is NOT what fVDB was built against.
+  - Host compiler: gcc-12 / g++-12 (Ubuntu 12.3.0-1ubuntu1~22.04.3) — the
+              conda env's own bundled gcc (14.3.0) is too new for CUDA 12.4
+              and was rejected by nvcc; forcing CC/CXX=gcc-12/g++-12 fixed it.
+  - pybind11: 3.0.1
+  - openvdb/fvdb commit: 7c04e6d ("Update setup.py"), branch feature/fvdb
+
+To apply on a matching machine (from inside the openvdb/ clone), strip this
+header first, then apply the remaining diff hunks:
+  sed -n '/^--- PATCH BODY BELOW ---$/,$p' fvdb_build_patches.diff | tail -n +3 | git apply -
+(or just read the 4 hunks below and make the equivalent edits by hand —
+it's only ~80 lines total across 4 files.)
+
+--- PATCH BODY BELOW ---
+
+diff --git a/fvdb/setup.py b/fvdb/setup.py
+index f2b7f9a..85325ea 100644
+--- a/fvdb/setup.py
++++ b/fvdb/setup.py
+@@ -138,7 +138,7 @@ class FVDBBuildCommand(cpp_extension.BuildExtension):
+ 
+         # Find all the headers and copy them into the build directory.
+         # This way extension modules of FVDB can include them.
+-        nanopath = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'nanovdb')
++        nanopath = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'nanovdb', 'nanovdb')
+         fvdb_headers = get_header_files_recursive('src', 'fvdb')
+         nanovdb_headers = get_header_files_recursive(nanopath, 'nanovdb')
+ 
+diff --git a/fvdb/src/detail/GridBatchImpl.cu b/fvdb/src/detail/GridBatchImpl.cu
+index b78ac61..81d9093 100644
+--- a/fvdb/src/detail/GridBatchImpl.cu
++++ b/fvdb/src/detail/GridBatchImpl.cu
+@@ -114,7 +114,11 @@ void GridBatchImpl::recomputeBatchOffsets() {
+ 
+ 
+ torch::Tensor GridBatchImpl::gridToWorldMatrix(int bid) const {
+-    return torch::linalg::inv(worldToGridMatrix(bid));
++    // Original: return torch::linalg::inv(worldToGridMatrix(bid));
++    // torch::linalg::inv (a convenience C++ wrapper) was removed from libtorch's headers
++    // in newer PyTorch versions. The underlying matrix-inverse operation itself still
++    // exists, just under a different name: at::linalg_inv.
++    return at::linalg_inv(worldToGridMatrix(bid));
+ }
+ 
+ c10::intrusive_ptr<GridBatchImpl> GridBatchImpl::clone(torch::Device device, bool blocking) const {
+diff --git a/fvdb/src/detail/ops/convolution/backend/MESparseConvolution.cu b/fvdb/src/detail/ops/convolution/backend/MESparseConvolution.cu
+index 55f61f1..a5cde20 100644
+--- a/fvdb/src/detail/ops/convolution/backend/MESparseConvolution.cu
++++ b/fvdb/src/detail/ops/convolution/backend/MESparseConvolution.cu
+@@ -85,7 +85,11 @@ void gpu_gemm<at::Half>(const cublasOperation_t transA, const cublasOperation_t
+   int lda = (transA == CUBLAS_OP_N) ? K : M;
+   int ldb = (transB == CUBLAS_OP_N) ? N : K;
+   cublasMath_t cublas_flags = CUBLAS_DEFAULT_MATH;
+-  if (!at::globalContext().allowFP16ReductionCuBLAS()) {
++  // Original: if (!at::globalContext().allowFP16ReductionCuBLAS()) {
++  // allowFP16ReductionCuBLAS() used to return bool (true = reduced-precision allowed);
++  // newer libtorch returns a 3-way enum instead. AllowReducedPrecisionWithSplitK is the
++  // enum value matching the old "true", so "not equal to that" matches the old "!...".
++  if (at::globalContext().allowFP16ReductionCuBLAS() != at::CuBLASReductionOption::AllowReducedPrecisionWithSplitK) {
+     cublas_flags = static_cast<cublasMath_t>(cublas_flags | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+   }
+ 
+diff --git a/fvdb/src/python/TypeCasters.h b/fvdb/src/python/TypeCasters.h
+index a8d37bb..2e8da5f 100644
+--- a/fvdb/src/python/TypeCasters.h
++++ b/fvdb/src/python/TypeCasters.h
+@@ -35,27 +35,10 @@ public:
+ };
+ 
+ 
+-template <> struct type_caster<torch::ScalarType> : public type_caster_base<torch::ScalarType> {
+-    using base = type_caster_base<torch::ScalarType>;
+-public:
+-    torch::ScalarType st_value;
+-
+-    bool load(handle src, bool convert) {
+-        if (THPDtype_Check(src.ptr())) {
+-            st_value = reinterpret_cast<THPDtype*>(src.ptr())->scalar_type;
+-            value = &st_value;
+-            return true;
+-        } else {
+-            return base::load(src, convert);
+-        }
+-    }
+-
+-    static handle cast(const at::ScalarType& src, return_value_policy policy, handle parent) {
+-        auto result = TORCH_MODULE.attr(fvdb::detail::TorchScalarTypeToStr(src).c_str());
+-        Py_INCREF(result.ptr());
+-        return result;
+-    }
+-};
++// Original (removed): a type_caster<torch::ScalarType> specialization used to be defined
++// here, converting Python torch.dtype objects to/from C++ at::ScalarType. Newer libtorch
++// now provides this exact specialization itself in torch/csrc/utils/pybind.h (pulled in via
++// torch/extension.h above), so keeping fvdb's own copy causes a duplicate-definition error.
+ 
+ 
+ template <> struct type_caster<fvdb::TorchDeviceOrString> : public type_caster_base<fvdb::TorchDeviceOrString> {
